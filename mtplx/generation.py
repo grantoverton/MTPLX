@@ -6884,7 +6884,23 @@ def generate_mtpk(
             "'graphbank', 'graphbank_capture_commit', 'target_prefix', "
             "or 'trim_commit'"
         )
-    from .qwen4_exp_mtp_patch import maybe_refuse_qwen4_exp_verify_lane
+    from .qwen4_exp_mtp_patch import (
+        maybe_refuse_qwen4_exp_verify_lane,
+        qwen4_exp_product_verify_strategy,
+    )
+
+    # qwen4_exp supports exactly one verify lane (batched + live snapshot).
+    # Callers that inherited a capture_commit default never chose it, so route
+    # them onto the supported lane rather than failing the whole run.
+    _qwen4_exp_supported_lane = qwen4_exp_product_verify_strategy(rt.model)
+    if (
+        _qwen4_exp_supported_lane is not None
+        and verify_strategy != _qwen4_exp_supported_lane
+    ):
+        import os as _os
+
+        _os.environ["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+        verify_strategy = _qwen4_exp_supported_lane
 
     maybe_refuse_qwen4_exp_verify_lane(rt.model, verify_strategy)
     target_prefix_verify = verify_strategy == "target_prefix"

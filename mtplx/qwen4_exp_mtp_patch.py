@@ -1096,10 +1096,50 @@ def inject_qwen4_exp_mtp_support(
 
     text_model = _text_model(model)
     mtp = _make_mtp_module(mtp_args, n_layers, qwen4)
-    if contract is not None:
-        from .mtp_patch import _quantize_mtp_module
+    if True:
+        from dataclasses import replace as _replace
 
-        if getattr(contract, "mtp_prequantized", False):
+        from .mtp_patch import (
+            MTPContract,
+            _contract_with_prequantized_module_specs,
+            _prequantized_module_prefixes,
+            _quantize_mtp_module,
+        )
+
+        # Trust the sidecar over the recipe: a head carrying weight/scales/
+        # biases triples is prequantized regardless of what mtp_policy said,
+        # and regardless of whether a contract was supplied at all (the tune
+        # path passes none, so the quantized head was silently discarded).
+        if contract is None and _prequantized_module_prefixes(weights):
+            contract = MTPContract()
+        if contract is not None and not getattr(contract, "mtp_prequantized", False):
+            _oq_prequantized_detected = _prequantized_module_prefixes(weights)
+            if _oq_prequantized_detected:
+                # Modules without a per-module override must still quantize,
+                # so seed the contract with the checkpoint's global geometry.
+                # Without it _quantize_mtp_module sees bits=None for those and
+                # leaves them dense, which fails exactly like no detection.
+                _global_q = config.get("quantization") or {}
+                contract = _replace(
+                    contract,
+                    mtp_prequantized=True,
+                    mtp_quant_bits=_global_q.get("bits", contract.mtp_quant_bits),
+                    mtp_quant_group_size=_global_q.get(
+                        "group_size", contract.mtp_quant_group_size
+                    ),
+                    mtp_quant_mode=_global_q.get("mode", contract.mtp_quant_mode),
+                )
+                contract = _contract_with_prequantized_module_specs(
+                    contract, weights, config
+                )
+                logger.warning(
+                    "[Qwen4Exp MTP inject] prequantized sidecar detected: "
+                    "%d modules, %d with config geometry",
+                    len(_oq_prequantized_detected),
+                    len(getattr(contract, "mtp_prequantized_module_specs", {}) or {}),
+                )
+
+        if contract is not None and getattr(contract, "mtp_prequantized", False):
             _quantize_mtp_module(mtp, contract)
     if weights:
         mtp.load_weights(list(weights.items()), strict=False)

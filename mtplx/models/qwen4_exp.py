@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import re
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -854,8 +856,13 @@ class GatedDeltaNet(nn.Module):
 
     def __call__(self, x: mx.array, mask: Any, cache: Any) -> mx.array:
         B, S, _ = x.shape
-        qkvz = self.in_proj_qkvz(x)
-        mixed_qkv, z = mx.split(qkvz, [self.conv_dim], axis=-1)
+        if "in_proj_qkvz" in self:
+            qkvz = self.in_proj_qkvz(x)
+            mixed_qkv, z = mx.split(qkvz, [self.conv_dim], axis=-1)
+        else:
+            # Unfused: identical maths, two matmuls instead of one.
+            mixed_qkv = self.in_proj_qkv(x)
+            z = self.in_proj_z(x)
         z = z.reshape(B, S, self.n_v, self.dv)
         b, a = mx.split(self.in_proj_ba(x), [self.n_v], axis=-1)
 
@@ -1477,6 +1484,20 @@ class _AttnCache(KVCache):
 # Top-level Model & Weight sanitization
 # ---------------------------------------------------------------------------
 
+_OQ_TRUNK_NORM_PLUS_ONE = (
+    ".hc_norm.weight",
+    ".norm_conv.weight",
+    ".norm_key.weight",
+    ".norm_query.weight",
+    ".k_layernorm.weight",
+    ".q_layernorm.weight",
+    ".k_norm.weight",
+    ".q_norm.weight",
+)
+
+
+_OQ_NGRAM_SHARDS_RE = re.compile(r"ngram_embedding\.shards\.(\d+)\.")
+
 _NGRAM_SHARD_MARKER = ".ngram_embedding.shard_"
 _NGRAM_SHARD_LEAVES = ("weight", "scales", "biases")
 
@@ -1575,6 +1596,30 @@ def _concat_proj_leaves(
     return fused
 
 
+def _concat_compatible(
+    left: Dict[str, Any], right: Dict[str, Any], axis: int
+) -> bool:
+    """True when every leaf can be concatenated along ``axis``.
+
+    Concatenation requires all non-axis dimensions to match, which for packed
+    quantized tensors implicitly requires the same bits and group_size: the
+    packed width is in_features*bits/32 and the scales width is
+    in_features/group_size. Comparing shapes therefore checks the packing
+    geometry without needing to recover bits or group_size.
+    """
+    for leaf in _PROJ_LEAVES:
+        if leaf not in left or leaf not in right:
+            continue
+        ls = getattr(left[leaf], "shape", None)
+        rs = getattr(right[leaf], "shape", None)
+        if ls is None or rs is None or len(ls) != len(rs):
+            return False
+        for i, (a, b) in enumerate(zip(ls, rs)):
+            if i != axis and a != b:
+                return False
+    return True
+
+
 def _pop_proj(weights: Dict[str, Any], stem: str) -> None:
     for leaf in _PROJ_LEAVES:
         weights.pop(f"{stem}.{leaf}", None)
@@ -1608,6 +1653,10 @@ def _fuse_proj_pair(
     if left_status != right_status or left_status == "missing":
         return False
     axis = _output_axis(left["weight"])
+    if not _concat_compatible(left, right, axis):
+        # Mixed packing geometry (oQ mixed precision). Leave the pair split;
+        # the module falls back to calling the two projections separately.
+        return False
     _write_proj(weights, dest_stem, _concat_proj_leaves(left, right, axis))
     _pop_proj(weights, left_stem)
     _pop_proj(weights, right_stem)
@@ -1698,6 +1747,24 @@ def sanitize(weights: Dict[str, Any]) -> Dict[str, Any]:
             k = k[len("language_model.") :]
         if k.startswith("vision_tower.") or k.startswith("model.visual."):
             continue
+        if k.endswith("ngram_embedding.weight_scale"):
+            # oQ keeps the PLE table's shared scale; this module has no slot for
+            # it. Identity is safe to drop, anything else would mis-scale.
+            if abs(float(v.reshape(-1)[0]) - 1.0) > 1e-3:
+                raise ValueError(
+                    f"{k} is {float(v.reshape(-1)[0])}, not identity; this "
+                    "module cannot apply a non-unit PLE scale"
+                )
+            continue
+        # oQ stores the n-gram table as a module list ("shards.7"); the fuser
+        # below looks for the release's flat attributes ("shard_7").
+        k = _OQ_NGRAM_SHARDS_RE.sub(r"ngram_embedding.shard_\1.", k)
+        # qwen4_exp keeps these gains zero-centered and the reference applies
+        # normed*(1+w). This module's RMSNorm applies normed*w, and oMLX does
+        # not bake the shift in, so it is baked in here. mtp.* is excluded:
+        # _shift_qwen4_gemma_mtp_norms already shifts that path.
+        if not k.startswith("mtp.") and k.endswith(_OQ_TRUNK_NORM_PLUS_ONE):
+            v = v + 1.0
         if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
             if v.shape[1] == 1:
                 v = v.transpose(0, 2, 1)
@@ -1802,11 +1869,31 @@ class Model(nn.Module):
 
     def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
         sanitized = sanitize(weights)
+        # Any layer whose GDN projections could not be fused keeps split keys.
+        # Swap that layer's fused Linear for the matching pair so the parameter
+        # tree lines up with the checkpoint. Runs before quantize/load_weights.
+        for key in sanitized:
+            m = re.match(
+                r"model\.layers\.(\d+)\.linear_attn\.in_proj_qkv\.weight$", key
+            )
+            if not m:
+                continue
+            attn = self.model.layers[int(m.group(1))].linear_attn
+            if "in_proj_qkvz" not in attn:
+                continue
+            d = attn.in_proj_qkvz.weight.shape[-1]
+            attn.pop("in_proj_qkvz", None)
+            attn.in_proj_qkv = nn.Linear(d, attn.conv_dim, bias=False)
+            attn.in_proj_z = nn.Linear(d, attn.value_dim, bias=False)
         # Retain MTP tensors accessible via side-channel for MTP lane,
         # but exclude them from strict trunk loading.
-        self.mtp_weights = {
+        # Plain attribute assignment on an nn.Module registers the dict as a
+        # parameter subtree, so the MTP tensors come straight back in as
+        # expected "mtp_weights.mtp.*" parameters and strict loading fails.
+        # Bypass registration so the side-channel really is off to the side.
+        object.__setattr__(self, "mtp_weights", {
             k: v for k, v in sanitized.items() if k.startswith("mtp.")
-        }
+        })
         return {k: v for k, v in sanitized.items() if not k.startswith("mtp.")}
 
     @property
