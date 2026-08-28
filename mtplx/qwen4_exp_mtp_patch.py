@@ -1263,6 +1263,7 @@ def inject_qwen4_exp_mtp_support(
             position_offset: int | None = None,
             mtp_depth: int | None = None,
             reuse_sparse_indices: bool | None = None,
+            input_embeddings=None,
         ):
             del mtp_hidden_variant, concat_order
             layer_caches = mtp_cache if mtp_cache is not None else self.make_mtp_cache()
@@ -1283,9 +1284,25 @@ def inject_qwen4_exp_mtp_support(
             #   h = fc_hidden(h)   # shared Linear(H,H) per stream
             #   x = e.unsqueeze(-2) + h ; flatten to [T, hc*H]
             # Mean-collapse-then-tile was the zero-accept assembly bug.
-            e = self.mtp.fc_embedding(
-                self.mtp.pre_fc_norm_embedding(self._embed(next_token_ids))
-            )
+            # Vision splice: when the caller supplies embedding rows (image
+            # positions already replaced by vision-tower output), draft from
+            # those rows instead of re-embedding the surrogate ids, which are
+            # out-of-vocab placeholders. Mirrors the AR path in
+            # models/qwen4_exp.py. Silently dropping them would rebuild the
+            # draft-history corruption runtime.py guards against.
+            if input_embeddings is None:
+                _mtp_emb = self._embed(next_token_ids)
+            else:
+                _mtp_emb = input_embeddings
+                if _mtp_emb.ndim == 2:
+                    _mtp_emb = _mtp_emb[None]
+                if _mtp_emb.shape[:-1] != next_token_ids.shape:
+                    raise ValueError(
+                        "qwen4_exp MTP input_embeddings shape "
+                        f"{tuple(_mtp_emb.shape)} does not match ids "
+                        f"{tuple(next_token_ids.shape)}"
+                    )
+            e = self.mtp.fc_embedding(self.mtp.pre_fc_norm_embedding(_mtp_emb))
             h = self.mtp.pre_fc_norm_hidden(hidden_states)
             h = h.reshape(*h.shape[:-1], hc, d)
             h = self.mtp.fc_hidden(h)
