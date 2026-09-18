@@ -44,3 +44,9 @@ benchmark_outputs/
 .hf-home/
 .claude/
 .devspace/
+
+# Locally built native kernels (see mtplx/vendor/glm5_omlx/README.md);
+# source ships under csrc/, binaries are built per-interpreter/arch.
+mtplx/vendor/glm5_omlx/glm_moe_dsa/_ext.cpython-*.so
+mtplx/vendor/glm5_omlx/glm_moe_dsa/libomlx_glm_kernel_ops.dylib
+mtplx/vendor/glm5_omlx/glm_moe_dsa/omlx_glm_kernels.metallib
