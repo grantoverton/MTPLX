@@ -18,6 +18,7 @@ SUPPORTED_ARCH_IDS = {
     "qwen3-next-mtp",
     "deepseek-v3-mtp",
     "glm-moe-dsa-mtp",
+    "glm5-next-mtp",
     "glm4-moe-mtp",
     "glm4-moe-lite-mtp",
     "mimo-mtp",
@@ -290,6 +291,34 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         notes=(
             "GLM MoE DSA is an mlx-lm DeepSeek V3.2-derived architecture; "
             "MTPLX routes verified-contract artifacts through the DeepSeek MTP backend."
+        ),
+    ),
+    "glm5-next-mtp": ArchitectureSupport(
+        arch_id="glm5-next-mtp",
+        display_name="GLM-5.3 (glm5_next) MTP",
+        family="glm",
+        backend="glm5_next",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native",
+        can_run_verified=True,
+        aliases=(
+            "glm5_next",
+            "glm5_next_text",
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForCausalLM",
+        ),
+        family_gate="glm5-nextn-mtp-markers",
+        references=(
+            "REFERENCES:mlx-vlm/mlx_vlm/models/glm5_next/language.py",
+            "REFERENCES:oMLX/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py",
+        ),
+        notes=(
+            "GLM-5.3-Flash is a hybrid: 29 KDA linear-attention layers + 11 "
+            "DSA-indexer full-attention layers + hyper-connections + nextn MTP. "
+            "Distinct from glm_moe_dsa (all-DSA, no KDA). In-tree model classes "
+            "wrap mlx-vlm>=0.6.17's glm5_next; MTP block rides "
+            "language_model.mtp.* tensors and shares the indexer "
+            "(index_share_for_mtp_iteration)."
         ),
     ),
     "deepseek-v4": ArchitectureSupport(
@@ -1057,6 +1086,21 @@ def _passes_appended_layer_gate(inspection: Any) -> bool:
     return True
 
 
+def _passes_glm5_nextn_gate(inspection: Any) -> bool:
+    """GLM-5.3 nextn MTP: ``language_model.mtp.0.block.*`` (VLM export) or
+    ``mtp.0.*`` (text-only export) marker keys. num_nextn_predict_layers lives
+    in text_config, so the gate is weight-key driven, not config-field driven."""
+    keys = _weight_keys(inspection)
+    if not keys:
+        return False
+    return _has_marker_under_prefixes(
+        keys,
+        ("language_model.mtp.0.", "mtp.0.", "model.mtp.0."),
+        (),
+        ("block.", "eh_proj", "enorm", "hnorm", "shared_head"),
+    )
+
+
 def _passes_mimo_layer_gate(inspection: Any) -> bool:
     keys = _weight_keys(inspection)
     if not keys:
@@ -1179,7 +1223,7 @@ _DECLARED_MODULES_LOWERED = {
 # deliberately absent: its runnability is decided by the pinned-artifact
 # geometry/sidecar gate on its catalog row (supply-chain fence), never by
 # model_type alone.
-_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text"}
+_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text", "glm5_next", "glm5_next_text"}
 
 # Families whose catalog family_gate is an artifact-integrity fence (pinned
 # geometry + pinned sidecars). A gate failure here refuses outright and is
@@ -1355,6 +1399,8 @@ def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool
         )
     if arch_id == "hy-v3-mtp":
         return _passes_hy_v3_gate(inspection)
+    if arch_id == "glm5-next-mtp":
+        return _passes_glm5_nextn_gate(inspection)
     if arch_id in {
         "deepseek-v3-mtp",
         "glm-moe-dsa-mtp",

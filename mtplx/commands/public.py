@@ -1360,6 +1360,14 @@ def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
 def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
     descriptor = descriptor_from_inspection(inspection)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if _inspection_backend_id(inspection) == "glm5_next":
+        # Same shape as qwen4_exp: the capture-commit verifier reimplements
+        # the trunk forward against qwen3-next module names (.linear_attn,
+        # 3-D hidden, plain residuals). glm5_next is 4-D HyperConnection +
+        # vendored KDA/DSA internals — batched verify snapshots/restores the
+        # recurrent caches generically instead.
+        if "verify-strategy" not in cli_flags:
+            args.verify_strategy = "batched"
     if _inspection_backend_id(inspection) == "qwen4_exp":
         # Flash-Next verify defaults: the capture-commit verifier walks the
         # qwen3-next GDN internals, which this family's own GDN classes do

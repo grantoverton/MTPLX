@@ -568,11 +568,19 @@ def _finalize_mtp_weights(
         if scales_key != key and scales_key in raw_mtp and biases_key in raw_mtp:
             if mx is None:
                 raise RuntimeError("MLX is required to dequantize embedded MTP weights")
+            gs = group_size
+            w_shape = tuple(raw_mtp[key].shape)
+            s_shape = tuple(raw_mtp[scales_key].shape)
+            if bits != 32 and w_shape and s_shape and s_shape[-1]:
+                in_features = w_shape[-1] * 32 // bits
+                derived = in_features // s_shape[-1]
+                if in_features % s_shape[-1] == 0 and derived != group_size:
+                    gs = derived
             weights[key] = mx.dequantize(
                 raw_mtp[key],
                 raw_mtp[scales_key],
                 raw_mtp[biases_key],
-                group_size=group_size,
+                group_size=gs,
                 bits=bits,
             )
             processed.update({key, scales_key, biases_key})

@@ -1104,6 +1104,12 @@ def _qwen4_exp_model_classes() -> tuple[type, type]:
     return Model, ModelArgs
 
 
+def _glm5_next_model_classes() -> tuple[type, type]:
+    from .models.glm5_next import model_classes
+
+    return model_classes()
+
+
 # model_type -> loader of MTPLX-owned (Model, ModelArgs) classes for
 # architectures the pinned mlx-lm does not implement. A new in-tree
 # architecture (e.g. the Qwen3.8-Flash-Next backend) registers its loader
@@ -1117,6 +1123,10 @@ _INTREE_MODEL_CLASS_LOADERS: dict[str, Callable[[], tuple[type, type]]] = {
     # text_config.model_type for multimodal checkpoints, and text-only
     # re-exports carry it at top level. Same trunk, same classes.
     "qwen4_exp_text": _qwen4_exp_model_classes,
+    # GLM-5.3 (glm5_next): hybrid KDA + DSA-indexer MoE. Top-level model_type
+    # on the VLM checkpoint; glm5_next_text covers text-only exports.
+    "glm5_next": _glm5_next_model_classes,
+    "glm5_next_text": _glm5_next_model_classes,
 }
 
 

@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 GLM_MTP_MODEL_TYPES = {
     "glm4_moe",
     "glm4_moe_lite",
+    "glm5_next",
+    "glm5_next_text",
 }
 
 
@@ -38,6 +40,16 @@ def is_glm_mtp_config(config: dict[str, Any]) -> bool:
 
 def _glm_impl(config: dict[str, Any]) -> dict[str, Any]:
     model_type = _model_type(config)
+    if model_type in {"glm5_next", "glm5_next_text"}:
+        from mlx_lm.models.cache import CacheList, KVCache, PoolingCache
+
+        from mtplx.models.glm5_next import mtp_impl
+
+        impl = mtp_impl()
+        tcfg = text_config(config)
+        kpool = int(tcfg.get("index_kpool", 4) or 4)
+        impl["cache_factory"] = lambda: CacheList(KVCache(), PoolingCache(kpool))
+        return impl
     if model_type == "glm4_moe_lite":
         from mlx_lm.models import glm4_moe_lite as impl
         from mlx_lm.models.cache import KVCache
@@ -91,6 +103,20 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
             for key, rel in weight_map.items()
             if str(key).startswith(wanted_prefixes)
         }
+        if not selected:
+            # Embedded dialect: ``language_model.mtp.*`` / ``mtp.*`` tensors live
+            # inside the trunk shards (glm5_next, DeepSeek-V3 style sidecars).
+            selected = {
+                model_path / rel
+                for key, rel in weight_map.items()
+                if ".mtp." in str(key) or str(key).startswith("mtp.")
+            }
+            # The shared lm_head feeds the MTP block's shared_head_head.
+            selected.update(
+                model_path / rel
+                for key, rel in weight_map.items()
+                if str(key).endswith("lm_head.weight")
+            )
         if selected:
             return sorted(selected)
 
@@ -164,13 +190,29 @@ def _rewrite_glm_mtp_weights(
     mapped: dict[str, Any] = {}
     shared_lm_head: dict[str, Any] = {}
     for key, value in raw.items():
+        key = key.removeprefix("language_model.")
         if "rotary_emb.inv_freq" in key:
             continue
         if key in {"lm_head.weight", "lm_head.scales", "lm_head.biases"}:
             shared_lm_head[key.removeprefix("lm_head.")] = value
             continue
         if key.startswith("mtp."):
-            mapped[key.removeprefix("mtp.")] = value
+            # Embedded dialect: mtp.{i}.{enorm,hnorm,eh_proj,norm,block.*} ->
+            # layers.{i}.{enorm,hnorm,eh_proj} / mtp_block / shared_head_norm.
+            rest = key.removeprefix("mtp.")
+            head, _, suffix = rest.partition(".")
+            if head.isdigit() and suffix:
+                local_prefix = f"layers.{head}"
+                if suffix.startswith("block."):
+                    mapped[f"{local_prefix}.mtp_block.{suffix.removeprefix('block.')}"] = value
+                elif suffix.startswith(("enorm.", "hnorm.", "eh_proj.")):
+                    mapped[f"{local_prefix}.{suffix}"] = value
+                elif suffix.startswith("norm."):
+                    mapped[f"{local_prefix}.shared_head_norm.{suffix.removeprefix('norm.')}"] = value
+                else:
+                    mapped[f"{local_prefix}.{suffix}"] = value
+            else:
+                mapped[rest] = value
             continue
         if key.startswith("layers."):
             mapped[key] = value
@@ -240,16 +282,60 @@ def _quantize_for_loaded_weights(mtp: Any, config: dict[str, Any], weights: dict
     if "group_size" not in quantization or "bits" not in quantization:
         return
 
+    tcfg = text_config(config)
+    per_module = (
+        tcfg.get("quantization")
+        or config.get("quantization")
+        or config.get("quantization_config")
+        or {}
+    )
+
+    def dict_key_for(path: str) -> str | None:
+        """Module path -> quantization-dict key across the known dialects."""
+        # layers.{i}.mtp_block.X -> language_model.mtp.{i}.block.X (glm5 embedded)
+        # layers.{i}.{enorm,hnorm,eh_proj,shared_head_norm} -> language_model.mtp.{i}.X
+        parts = path.split(".")
+        if parts[:1] == ["layers"] and parts[1].isdigit():
+            idx = parts[1]
+            tail = ".".join(parts[2:])
+            if tail.startswith("mtp_block."):
+                return f"language_model.mtp.{idx}.block.{tail.removeprefix('mtp_block.')}"
+            if tail.startswith("shared_head_head"):
+                return "language_model.lm_head"
+            return f"language_model.mtp.{idx}.{tail}"
+        return path
+
+    def spec_for(path: str):
+        scales_key = f"{path}.scales"
+        if scales_key not in weights:
+            return None
+        spec = per_module.get(dict_key_for(path)) or {}
+        bits = int(spec.get("bits", quantization["bits"]))
+        group_size = spec.get("group_size")
+        if group_size is None:
+            # Derive gs from tensor geometry: in = packed_cols * 32 / bits.
+            packed = weights.get(f"{path}.weight")
+            scales = weights[scales_key]
+            if packed is None or not scales.shape[-1]:
+                group_size = int(quantization["group_size"])
+            else:
+                in_features = int(packed.shape[-1]) * 32 // bits
+                derived = in_features // int(scales.shape[-1])
+                group_size = (
+                    derived
+                    if in_features % int(scales.shape[-1]) == 0
+                    else int(quantization["group_size"])
+                )
+        return {
+            "group_size": int(group_size),
+            "bits": bits,
+            "mode": spec.get("mode", quantization.get("mode", "affine")),
+        }
+
     def class_predicate(path: str, module: Any):
         if not hasattr(module, "to_quantized"):
             return False
-        if f"{path}.scales" in weights:
-            return {
-                "group_size": int(quantization["group_size"]),
-                "bits": int(quantization["bits"]),
-                "mode": quantization.get("mode", "affine"),
-            }
-        return False
+        return spec_for(path) or False
 
     nn.quantize(
         mtp,
@@ -289,7 +375,11 @@ def _make_glm_mtp_module(config: dict[str, Any], args: Any):
                     axis=-1,
                 )
             )
-            mask = create_attention_mask(mixed, cache, return_array=return_array_mask)
+            mask_cache = cache
+            selector = impl.get("mask_cache")
+            if selector is not None:
+                mask_cache = selector(cache)
+            mask = create_attention_mask(mixed, mask_cache, return_array=return_array_mask)
             hidden = self.mtp_block(mixed, mask=mask, cache=cache)
             logits = self.shared_head_head(self.shared_head_norm(hidden))
             return logits, hidden
@@ -319,7 +409,11 @@ def inject_glm_mtp_support(
     model_path = Path(model_path)
     tcfg = text_config(config)
     impl = _glm_impl(config)
-    args = getattr(model, "args", None)
+    target_model = impl.get("mtp_target", lambda m: m)(model)
+    trunk_getter = impl.get("trunk", lambda m: m.model)
+    lm_head_getter = impl.get("lm_head", lambda m: m.lm_head)
+    embed_getter = impl.get("embed_tokens", lambda m: m.model.embed_tokens)
+    args = getattr(target_model, "args", None) or getattr(model, "args", None)
     if args is None:
         args = impl["args_cls"].from_dict(tcfg)
 
@@ -344,7 +438,7 @@ def inject_glm_mtp_support(
     mx.eval(mtp.parameters())
 
     cache_factory = impl["cache_factory"]
-    original_outer_class = model.__class__
+    original_outer_class = target_model.__class__
 
     class _MTPLXGLMModel(original_outer_class):
         def __call__(
@@ -358,8 +452,8 @@ def inject_glm_mtp_support(
         ):
             if input_embeddings is not None:
                 raise ValueError("GLM MTP backend does not support input_embeddings")
-            hidden = self.model(inputs, cache)
-            logits = self.lm_head(hidden)
+            hidden = trunk_getter(self)(inputs, cache)
+            logits = lm_head_getter(self)(hidden)
             if not return_hidden:
                 return logits
             return logits, hidden
@@ -386,7 +480,7 @@ def inject_glm_mtp_support(
             logits, hidden = self.mtp.layers[depth](
                 next_token_ids,
                 hidden_states,
-                embed_tokens=self.model.embed_tokens,
+                embed_tokens=embed_getter(self),
                 cache=layer_cache,
             )
             if not return_hidden:
@@ -401,6 +495,8 @@ def inject_glm_mtp_support(
             concat_order=None,
             position_offset: int | None = None,
             mtp_depth: int | None = None,
+            mtp_hidden_variant: str | None = None,
+            input_embeddings=None,
         ):
             _logits, hidden = self.mtp_forward(
                 hidden_states,
@@ -422,7 +518,42 @@ def inject_glm_mtp_support(
             layers = getattr(getattr(self, "model", None), "layers", ())
             return [cache_factory() for _ in layers]
 
-    model.mtp = mtp
-    model.__class__ = _MTPLXGLMModel
+    target_model.mtp = mtp
+    target_model.__class__ = _MTPLXGLMModel
+
+    if target_model is not model:
+        # VLM-wrapped trunk (glm5_next): the engine drives the outer model, so
+        # it needs the MTP surface too. Delegate to the patched language_model
+        # and forward MTP kwargs through __call__ (return_hidden et al.).
+        outer_class = model.__class__
+
+        class _MTPLXGLMOuterFacade(outer_class):
+            def __call__(
+                self,
+                inputs=None,
+                cache=None,
+                inputs_embeds=None,
+                mask=None,
+                return_hidden: bool = False,
+                **kwargs,
+            ):
+                return self.language_model(
+                    inputs,
+                    inputs_embeds=inputs_embeds,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    **kwargs,
+                )
+
+            def mtp_forward(self, *a, **k):
+                return self.language_model.mtp_forward(*a, **k)
+
+            def mtp_update_cache(self, *a, **k):
+                return self.language_model.mtp_update_cache(*a, **k)
+
+            def make_mtp_cache(self):
+                return self.language_model.make_mtp_cache()
+
+        model.__class__ = _MTPLXGLMOuterFacade
     logger.info("[GLM MTP inject] Loaded %d tensors from %s", len(mapped), model_path)
     return True
