@@ -31,7 +31,7 @@ _FUSED_SDPA_DIMS = (64, 80, 128)
 # checkpoints) uses ``model.visual.*``. compressed_tensors._mlx_key remaps
 # the latter to ``vision_tower.*`` for the trunk; the vision module must
 # recognise both.
-_VISION_PREFIXES = ("vision_tower.", "model.visual.")
+_VISION_PREFIXES = ("vision_tower.", "model.visual.", "vision_model.")
 
 
 def resolve_vision_prefix(weight_map: dict) -> str | None:
