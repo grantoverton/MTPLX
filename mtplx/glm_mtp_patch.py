@@ -41,11 +41,13 @@ def is_glm_mtp_config(config: dict[str, Any]) -> bool:
 def _glm_impl(config: dict[str, Any]) -> dict[str, Any]:
     model_type = _model_type(config)
     if model_type in {"glm5_next", "glm5_next_text"}:
-        from mlx_lm.models.cache import CacheList, KVCache, PoolingCache
-
         from mtplx.models.glm5_next import mtp_impl
 
+        # mtp_impl installs the vendored PoolingCache shim when the running
+        # mlx-lm predates it (PR 1192), so this import must follow the call.
         impl = mtp_impl()
+        from mlx_lm.models.cache import CacheList, KVCache, PoolingCache
+
         tcfg = text_config(config)
         kpool = int(tcfg.get("index_kpool", 4) or 4)
         impl["cache_factory"] = lambda: CacheList(KVCache(), PoolingCache(kpool))
