@@ -87,7 +87,24 @@ def _load_weight_file(path: Path) -> dict[str, Any]:
 def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Path]:
     mtp_file = expected_mtp_file(model_path, config)
     if mtp_file.exists():
-        return [mtp_file]
+        files = [mtp_file]
+        # A configured sidecar carries the head block only; the shared
+        # lm_head that feeds shared_head_head still lives in the trunk
+        # shards, so the draft output projection needs those files too.
+        index_path = model_path / "model.safetensors.index.json"
+        if index_path.exists():
+            try:
+                weight_map = json.loads(index_path.read_text(encoding="utf-8")).get("weight_map", {})
+            except Exception:
+                weight_map = {}
+            for rel in sorted({
+                rel for key, rel in weight_map.items()
+                if str(key).endswith("lm_head.weight")
+            }):
+                shard = model_path / rel
+                if shard not in files:
+                    files.append(shard)
+        return files
 
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
