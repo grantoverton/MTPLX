@@ -871,6 +871,62 @@ GLM_MTP_DESCRIPTOR = BackendDescriptor(
 )
 
 
+GLM5_NEXT_DESCRIPTOR = BackendDescriptor(
+    backend_id="glm5_next",
+    architecture_id="glm5-next-mtp",
+    model_family="glm",
+    display_name="GLM-5.3 (glm5_next) native MTP",
+    artifact_layout="single_mlx_folder_native_mtp",
+    runtime_capabilities=NATIVE_CONTRACT_DESCRIPTOR.runtime_capabilities,
+    # Official GLM-5.3 generation_config: temperature 1.0, top_p 0.95, no top_k.
+    sampler_defaults=SamplerDefaults(temperature=1.0, top_p=0.95, top_k=0),
+    # GLM-5.3 thinks always (the template has no off switch) and selects effort
+    # through `reasoning_effort`: low -> "Reasoning Effort: Low", high ->
+    # "Reasoning Effort: High", anything else -> "Reasoning Effort: Max".
+    # Canonical MTPLX levels map onto the three real template states:
+    #   low->Low, medium->high (up-map), high->High, xhigh->Max (fallback),
+    #   auto->xhigh->Max. The model card recommends High for agent lanes:
+    #   High ~ Max accuracy at roughly half the output tokens.
+    reasoning_codec=ReasoningCodec(
+        parser="qwen3",
+        display_name="GLM-5.3 think tags",
+        default_mode="auto",
+        effort_levels=("low", "high", "xhigh"),
+        default_effort="xhigh",
+        default_agent_effort="high",
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=3,
+        minimum=1,
+        maximum=3,
+        unit="depth",
+    ),
+    uses_external_assistant=False,
+    uses_draft_lm_head=True,
+    hidden_variant="post_norm",
+    tune_policy=TunePolicy(
+        supported=False,
+        unsupported_reason="Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason="KV quantization is not supported for GLM.",
+    ),
+    validation_status="experimental_contract_gated",
+    status="experimental_contract_gated",
+    notes=(
+        "Hybrid KDA+DSA+HyperConnection arch; single embedded MTP head "
+        "(language_model.mtp.0.*), engine caps draft depth at 3.",
+        "Without this entry the backend fell back to NATIVE_CONTRACT's "
+        "parser='none' codec, so reasoning_effort never reached the chat "
+        "template and every request rendered the Effort: Max default "
+        "(bench collapse receipt 2026-09-18).",
+    ),
+)
+
+
 HY_V3_MTP_DESCRIPTOR = BackendDescriptor(
     backend_id="hy_v3_mtp",
     architecture_id="hy-v3-mtp",
@@ -1039,6 +1095,7 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
+    GLM5_NEXT_DESCRIPTOR.backend_id: GLM5_NEXT_DESCRIPTOR,
     HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
     NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR.backend_id: (
         NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR
@@ -1067,6 +1124,8 @@ def descriptor_for_architecture_id(value: str | None) -> BackendDescriptor | Non
         return None
     if arch_id in {"glm-moe-dsa-mtp", "glm4-moe-lite-mtp"}:
         return GLM_MTP_DESCRIPTOR
+    if arch_id == "glm5-next-mtp":
+        return GLM5_NEXT_DESCRIPTOR
     for descriptor in backend_descriptors():
         if descriptor.architecture_id == arch_id:
             return descriptor
@@ -1371,6 +1430,11 @@ def reasoning_policy_for_model(
     if family == "step":
         return STEP3P5_MTP_DESCRIPTOR.reasoning_codec
     if family == "glm":
+        # glm5_next is its own backend descriptor (the GLM-5.3 template
+        # takes reasoning_effort where GLM-4-MoE's does not); resolve the
+        # model marker so glm_moe_dsa keeps the MTP-lane codec.
+        if descriptor is not None and descriptor.backend_id == "glm5_next":
+            return GLM5_NEXT_DESCRIPTOR.reasoning_codec
         return GLM_MTP_DESCRIPTOR.reasoning_codec
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.reasoning_codec
