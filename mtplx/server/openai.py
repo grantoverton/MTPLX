@@ -1106,6 +1106,18 @@ def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
     return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
 
 
+def _served_model_type_is_glm5_next(args: argparse.Namespace) -> bool:
+    """Mirror of _served_model_type_is_qwen4_exp for the glm5_next family."""
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return False
+    mt = str(cfg.get("model_type") or "").lower()
+    tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
+    return "glm5_next" in (mt, tmt) or "glm5_next_text" in (mt, tmt)
+
+
 _QWEN4_PORT_TRUTHY = frozenset({"1", "true", "yes", "on"})
 # Gates of the PR #391 Flash-Next ports, one per ported step.
 _QWEN4_PORT_KEYS = (
@@ -2883,7 +2895,10 @@ def _coerce_family_verify_strategy(args: argparse.Namespace) -> None:
     MTPLX_FAMILY_CAPTURE_COMMIT, which wraps the batched verify instead of
     replacing it, so 'batched' is the only correct base strategy here.
     """
-    if not _served_model_type_is_qwen4_exp(args):
+    if not (
+        _served_model_type_is_qwen4_exp(args)
+        or _served_model_type_is_glm5_next(args)
+    ):
         return
     strategy = (
         str(getattr(args, "verify_strategy", "") or "").strip().lower().replace("-", "_")
@@ -2896,6 +2911,13 @@ def _coerce_family_verify_strategy(args: argparse.Namespace) -> None:
             flush=True,
         )
         args.verify_strategy = "batched"
+    if _served_model_type_is_glm5_next(args):
+        # glm5's KDA/pooling caches are untrimmable: the verify snapshot is
+        # the only correct rollback state, and sustained's skip default
+        # strands it (before_verify=None on the first rejected draft). This
+        # runs before apply_profile_env, so it reads as an operator override
+        # (PROFILE_ENV_USER_OVERRIDE_KEYS) and the profile keeps it.
+        os.environ.setdefault("MTPLX_SKIP_VERIFY_SNAPSHOT", "0")
 
 
 class ServerState:
