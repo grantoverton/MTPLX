@@ -1354,6 +1354,8 @@ def kv_quant_policy_for_model(
     if family == "step":
         return STEP3P5_MTP_DESCRIPTOR.kv_quant_policy
     if family == "glm":
+        if descriptor is not None and descriptor.backend_id == "glm5_next":
+            return GLM5_NEXT_DESCRIPTOR.kv_quant_policy
         return GLM_MTP_DESCRIPTOR.kv_quant_policy
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.kv_quant_policy
@@ -1400,7 +1402,10 @@ def context_window_policy_for_model(
     elif family == "step":
         base = STEP3P5_MTP_DESCRIPTOR.context_window_policy
     elif family == "glm":
-        base = GLM_MTP_DESCRIPTOR.context_window_policy
+        if descriptor is not None and descriptor.backend_id == "glm5_next":
+            base = GLM5_NEXT_DESCRIPTOR.context_window_policy
+        else:
+            base = GLM_MTP_DESCRIPTOR.context_window_policy
     elif family == "deepseek":
         base = DEEPSEEK_MTP_DESCRIPTOR.context_window_policy
     else:
