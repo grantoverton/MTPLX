@@ -1093,11 +1093,27 @@ def _passes_glm5_nextn_gate(inspection: Any) -> bool:
     keys = _weight_keys(inspection)
     if not keys:
         return False
-    return _has_marker_under_prefixes(
+    if _has_marker_under_prefixes(
         keys,
         ("language_model.mtp.0.", "mtp.0.", "model.mtp.0."),
         (),
         ("block.", "eh_proj", "enorm", "hnorm", "shared_head"),
+    ):
+        return True
+    # Raw HF/BF16 exports keep the head as an appended decoder layer
+    # (model.language_model.layers.{num_hidden_layers}.*) rather than
+    # under an mtp. namespace; Forge repacks it into the sidecar form.
+    start = int(getattr(inspection, "num_hidden_layers", 0) or 0)
+    if start <= 0:
+        return False
+    return _has_marker_under_prefixes(
+        keys,
+        (
+            f"model.language_model.layers.{start}.",
+            f"language_model.layers.{start}.",
+            f"model.layers.{start}.",
+        ),
+        _APPENDED_LAYER_MARKER_SUFFIXES,
     )
 
 

@@ -140,6 +140,49 @@ def test_rewrite_sidecar_dialect_also_maps():
     assert "layers.0.shared_head_norm.weight" in mapped
 
 
+def test_rewrite_bf16_appended_layer_dialect_maps():
+    """zai-org GLM-5.3-Flash-BF16 keeps the head as an appended decoder
+    layer model.language_model.layers.45.* (text_config declares
+    num_nextn_predict_layers=1) with no shared_head.head — the output
+    projection is filled from the top-level lm_head.weight."""
+    sentinel = object()
+    raw = {
+        "model.language_model.layers.45.enorm.weight": object(),
+        "model.language_model.layers.45.hnorm.weight": object(),
+        "model.language_model.layers.45.eh_proj.weight": object(),
+        "model.language_model.layers.45.shared_head.norm.weight": object(),
+        "model.language_model.layers.45.input_layernorm.weight": object(),
+        "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight": object(),
+        "model.language_model.layers.45.mlp.gate.weight": object(),
+        "lm_head.weight": sentinel,
+    }
+    args = SimpleNamespace(n_routed_experts=0)
+    mapped = _rewrite_glm_mtp_weights(
+        raw, args=args, start_layer=45, num_mtp_layers=1, rewrite_mla_kv_b=False
+    )
+    assert "layers.0.enorm.weight" in mapped
+    assert "layers.0.mtp_block.self_attn.kv_a_proj_with_mqa.weight" in mapped
+    assert "layers.0.mtp_block.mlp.gate.weight" in mapped
+    assert "layers.0.shared_head_norm.weight" in mapped
+    assert mapped["layers.0.shared_head_head.weight"] is sentinel
+
+
+def test_mlx_lm_convert_module_routes_glm5(tmp_path):
+    from mtplx.commands.forge import _mlx_lm_convert_module
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": {"model_type": "glm5_next_text"},
+            }
+        )
+    )
+    assert _mlx_lm_convert_module(tmp_path) == "mtplx.commands.forge_glm5_convert"
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_next"}))
+    assert _mlx_lm_convert_module(tmp_path) == "mlx_lm"
+
+
 def test_vision_prefix_recognizes_vision_model():
     from mtplx.vision.qwen3_vl_tower import resolve_vision_prefix
 

@@ -20,6 +20,7 @@ from mtplx.artifacts import (
 GLM_47_FLASH = {"num_hidden_layers": 47, "num_nextn_predict_layers": 1}
 DEEPSEEK_V32 = {"num_hidden_layers": 61, "num_nextn_predict_layers": 1}
 MIMO_7B = {"num_hidden_layers": 36, "num_nextn_predict_layers": 1}
+GLM53_BF16 = {"text_config": {"num_hidden_layers": 45, "num_nextn_predict_layers": 1}}
 NO_MTP = {"num_hidden_layers": 32}
 
 
@@ -48,6 +49,21 @@ def test_the_two_layouts_do_not_claim_each_others_keys():
     # form; its head is not stored there and must not be matched by it.
     assert not is_appended_layer_mtp_key("model.mtp_layers.0.input_proj.weight", MIMO_7B)
     assert not is_mtp_layers_namespace_key("model.layers.47.embed_tokens.weight", GLM_47_FLASH)
+
+
+def test_glm53_bf16_head_is_an_appended_language_model_layer():
+    # zai-org/GLM-5.3-Flash-BF16 nests the decoder stack under
+    # model.language_model — the head is layer 45 of 45 declared layers.
+    assert list(appended_mtp_layer_range(GLM53_BF16)) == [45]
+    assert is_appended_layer_mtp_key(
+        "model.language_model.layers.45.eh_proj.weight", GLM53_BF16
+    )
+    assert is_appended_layer_mtp_key(
+        "model.language_model.layers.45.mlp.experts.12.gate_proj.weight", GLM53_BF16
+    )
+    assert not is_appended_layer_mtp_key(
+        "model.language_model.layers.44.self_attn.q_a_proj.weight", GLM53_BF16
+    )
 
 
 def test_a_config_without_an_mtp_head_matches_nothing():

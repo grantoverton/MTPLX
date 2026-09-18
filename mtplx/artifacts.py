@@ -193,8 +193,15 @@ def uses_appended_layer_mtp(config: dict[str, Any]) -> bool:
 def is_appended_layer_mtp_key(key: str, config: dict[str, Any]) -> bool:
     text = str(key)
     return any(
-        text.startswith(f"model.layers.{index}.")
+        text.startswith(prefix)
         for index in appended_mtp_layer_range(config)
+        for prefix in (
+            f"model.layers.{index}.",
+            # HF/VLM exports nest the decoder stack one level deeper:
+            # model.language_model.layers.{N}.* (GLM-5.3 BF16).
+            f"model.language_model.layers.{index}.",
+            f"language_model.layers.{index}.",
+        )
     )
 
 

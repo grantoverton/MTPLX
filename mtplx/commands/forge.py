@@ -377,6 +377,8 @@ def _inspection_has_mtp_weight_evidence(inspection: Any) -> bool:
         layer_idx = start + local_idx if start > 0 else local_idx
         prefixes = (
             f"model.layers.{layer_idx}.",
+            f"model.language_model.layers.{layer_idx}.",
+            f"language_model.layers.{layer_idx}.",
             f"backbone.layers.{layer_idx}.",
             f"mtp.layers.{local_idx}.",
             f"layers.{local_idx}.",
@@ -1436,7 +1438,7 @@ def _mlx_lm_convert_command(
         sys.executable,
         "-P",
         "-m",
-        "mlx_lm",
+        _mlx_lm_convert_module(source),
         "convert",
         "--hf-path",
         str(source),
@@ -1466,6 +1468,21 @@ def _mlx_lm_convert_command(
     if _body_dtype(recipe) == "fp16":
         command.extend(["--dtype", "float16"])
     return command
+
+
+def _mlx_lm_convert_module(source: Path) -> str:
+    # Upstream mlx-lm has no glm5_next; the vendored implementation is
+    # registered by the forge_glm5_convert driver instead.
+    try:
+        config = _load_json(source / "config.json")
+    except Exception:
+        config = {}
+    model_type = str(
+        text_config(config).get("model_type") or config.get("model_type") or ""
+    )
+    if model_type in {"glm5_next", "glm5_next_text"}:
+        return "mtplx.commands.forge_glm5_convert"
+    return "mlx_lm"
 
 
 def _convert_compressed_tensors_awq(

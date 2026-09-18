@@ -238,8 +238,14 @@ def _rewrite_glm_mtp_weights(
             continue
         for local_idx in range(num_mtp_layers):
             spec_idx = start_layer + local_idx
-            prefix = f"model.layers.{spec_idx}."
-            if not key.startswith(prefix):
+            for prefix in (
+                f"model.layers.{spec_idx}.",
+                f"model.language_model.layers.{spec_idx}.",
+                f"language_model.layers.{spec_idx}.",
+            ):
+                if key.startswith(prefix):
+                    break
+            else:
                 continue
             suffix = key.removeprefix(prefix)
             local_prefix = f"layers.{local_idx}"
