@@ -2713,7 +2713,10 @@ def _verify_rows_lane(model_path: Path) -> str:
     except Exception:
         return "tune"
     compatibility = getattr(inspection, "compatibility", {}) or {}
-    if str(compatibility.get("recommended_backend") or "") == "qwen4_exp":
+    if str(compatibility.get("recommended_backend") or "") in (
+        "qwen4_exp",
+        "glm5_next",
+    ):
         return "family-serve"
     return "tune"
 
@@ -2799,7 +2802,9 @@ def _run_verify_family_serve(
                     )
                 time.sleep(2.0)
 
-            def _measure(mode: str, salt: str) -> dict[str, Any]:
+            def _measure(
+                mode: str, salt: str, depth: int | None = None
+            ) -> dict[str, Any]:
                 body: dict[str, Any] = {
                     "model": model_path.name,
                     "messages": [
@@ -2819,6 +2824,10 @@ def _run_verify_family_serve(
                 if mode == "ar":
                     body["generation_mode"] = "ar"
                     headers["X-MTPLX-Allow-Client-Controls"] = "1"
+                elif depth is not None:
+                    body["generation_mode"] = "mtp"
+                    body[mtp_request_field] = int(depth)
+                    headers["X-MTPLX-Allow-Client-Controls"] = "1"
                 request = urllib.request.Request(
                     f"{base}/v1/chat/completions",
                     data=json.dumps(body).encode("utf-8"),
@@ -2835,8 +2844,30 @@ def _run_verify_family_serve(
                 return stats
 
             _measure("mtp", "warmup")  # first-load warm; discarded
-            for depth, mode in ((0, "ar"), (None, "mtp")):
-                samples = [_measure(mode, f"{mode}-{index}") for index in range(reps)]
+            try:
+                from mtplx.backends.descriptors import draft_semantics_for_model
+
+                mtp_request_field = str(
+                    getattr(
+                        draft_semantics_for_model(model_ref=str(model_path)),
+                        "request_field",
+                        "depth",
+                    )
+                    or "depth"
+                )
+            except Exception:
+                mtp_request_field = "depth"
+            # Verification requires a row per declared depth
+            # (_verify_rows_have_all_depths); families whose tune lane cannot
+            # drive them still owe the full declared range through serve.
+            mtp_depths = tuple(
+                int(depth) for depth in _forge_verify_depths(model_path) if int(depth) > 0
+            ) or (None,)
+            for depth, mode in ((0, "ar"), *((d, "mtp") for d in mtp_depths)):
+                samples = [
+                    _measure(mode, f"{mode}-{index}", depth=depth)
+                    for index in range(reps)
+                ]
                 tok_s = [float(s.get("decode_tok_s") or s.get("tok_s") or 0.0) for s in samples]
                 best = max(samples, key=lambda s: float(s.get("decode_tok_s") or 0.0))
                 row_depth = depth
