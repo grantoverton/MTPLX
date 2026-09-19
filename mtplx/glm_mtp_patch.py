@@ -585,7 +585,25 @@ def inject_glm_mtp_support(
         def make_cache(self):
             make_cache = getattr(super(), "make_cache", None)
             if callable(make_cache):
-                return make_cache()
+                caches = make_cache()
+                pair_cls = impl.get("cache_pair_cls")
+                if pair_cls is not None:
+                    # The vendored trunk pair is a bare CacheList with no
+                    # ``offset``: session-bank ``_trim_cache_ref_to_*``
+                    # restores then compute delta=0, keep the full snapshot
+                    # span, and the engine replays boundary tokens on top of
+                    # committed KV — restored generations diverge. Re-wrap
+                    # each pair so restores see and trim real offsets.
+                    from mlx_lm.models.cache import CacheList
+
+                    caches = [
+                        pair_cls(*entry.caches)
+                        if isinstance(entry, CacheList)
+                        and not hasattr(entry, "offset")
+                        else entry
+                        for entry in caches
+                    ]
+                return caches
             layers = getattr(getattr(self, "model", None), "layers", ())
             return [cache_factory() for _ in layers]
 

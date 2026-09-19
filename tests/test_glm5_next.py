@@ -400,3 +400,44 @@ def test_rewrite_tied_embedding_fills_shared_head():
         raw, args=args, start_layer=45, num_mtp_layers=1, rewrite_mla_kv_b=False
     )
     assert mapped["layers.0.shared_head_head.weight"] is sentinel
+
+
+def test_trunk_pair_offset_gates_session_bank_trims():
+    """The wrapped trunk pair must let ``_trim_cache_ref_to_prefix`` see real
+    offsets: mid-window restores trim; an untrimmable pool declines instead
+    of silently serving an over-long cache (the "TheThe" corruption)."""
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm.models.cache")
+    pytest.importorskip("mlx_vlm")
+    from mlx_lm.models.cache import CacheList, KVCache
+    from mtplx.models.glm5_next import mtp_impl
+    from mtplx.session_bank import _trim_cache_ref_to_prefix
+    from mtplx.vendor.glm5_omlx.deepseek_v4.cache_extras import PoolingCache
+
+    impl = mtp_impl(_glm5_config())
+    pair_cls = impl["cache_pair_cls"]
+
+    # Bare CacheList (what the vendored make_cache returned): offset stays
+    # invisible so the helper computes delta=0 and "succeeds" without
+    # trimming — the silent-corruption path.
+    bare_kv, bare_pool = KVCache(), PoolingCache(4)
+    bare_kv.offset = 6
+    bare = CacheList(bare_kv, bare_pool)
+    assert _trim_cache_ref_to_prefix([bare], 6) is True
+    assert bare_kv.offset == 6  # untrimmed — this was the bug
+
+    # Wrapped pair, mid-window: trims the real delta on both halves.
+    kv, pool = KVCache(), PoolingCache(4)
+    kv.offset = 6
+    pool.remainder = 3
+    wrapped = pair_cls(kv, pool)
+    assert _trim_cache_ref_to_prefix([wrapped], 6) is True
+    assert kv.offset == 5
+    assert pool.remainder == 2
+
+    # Wrapped pair at a pool window boundary with no undo log: the pool
+    # cannot give the token back, so the restore must decline cleanly.
+    kv2, pool2 = KVCache(), PoolingCache(4)
+    kv2.offset = 6
+    wrapped2 = pair_cls(kv2, pool2)
+    assert _trim_cache_ref_to_prefix([wrapped2], 6) is False

@@ -135,17 +135,21 @@ def mtp_impl(config: Dict[str, Any] | None = None):
             x = x + self.self_attn(self.input_layernorm(x), mask, cache)
             return x + self.mlp(self.post_attention_layernorm(x))
 
-    class _GLMMTPDraftCache(CacheList):
-        """CacheList exposing the engine's rollback surface for the draft head.
+    class GLMOffsetCacheList(CacheList):
+        """CacheList exposing the engine's offset/rollback surface.
 
         ``generation._mtp_cache_offset`` / ``_rollback_mtp_cache`` read
-        ``mtp_cache[0].offset`` and call ``trim(n)``. A plain CacheList has
-        ``trim`` (delegated to both halves) but no ``offset``, so the
-        recorded base offset stayed 0 and rejected draft positions were never
-        rolled back — acceptance decayed with output length. ``offset``
-        reports the KV half's token count; ``trim`` fans out to both halves,
+        ``mtp_cache[0].offset`` and call ``trim(n)``, and the session bank's
+        ``_trim_cache_ref_to_*`` helpers gate restores on ``entry.offset``.
+        A plain CacheList has ``trim`` (delegated to both halves) but no
+        ``offset``, so recorded base offsets stayed 0, rejected draft
+        positions were never rolled back, and restored prefix caches kept
+        tokens the engine then replayed on top of committed KV. ``offset``
+        reports the KV half's token count (PoolingCache's ``offset`` is a
+        compressed-row count, not tokens); ``trim`` fans out to both halves,
         where PoolingCache's armed undo covers multi-token rejections that
-        cross a pool window.
+        cross a pool window. Used for both the MTP draft cache and — via
+        ``glm_mtp_patch.make_cache`` — the vendored trunk pair.
         """
 
         @property
@@ -156,12 +160,15 @@ def mtp_impl(config: Dict[str, Any] | None = None):
     kpool = int(tcfg.get("index_kpool", 4) or 4)
 
     def cache_factory():
-        return _GLMMTPDraftCache(KVCache(), PoolingCache(kpool))
+        return GLMOffsetCacheList(KVCache(), PoolingCache(kpool))
 
     return {
         "args_cls": TextConfig,
         "layer_cls": Glm5NextMTPDecoderLayer,
         "cache_factory": cache_factory,
+        # Re-wraps the vendored trunk ``make_cache`` pairs (bare CacheList)
+        # so session-bank restores can see and trim real token offsets.
+        "cache_pair_cls": GLMOffsetCacheList,
         "return_array_mask": True,
         "rewrite_mla_kv_b": False,
         # glm5 checkpoints are VLM-wrapped: patch language_model, not model.
