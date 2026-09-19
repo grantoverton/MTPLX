@@ -1,7 +1,7 @@
 """GLM-5.3 (``glm5_next``) in-tree model classes for MTPLX.
 
 No ``glm5_next`` implementation exists in the pinned mlx-lm (0.31.3). The
-architecture lives in mlx-vlm upstream (>=0.6.17) but *that* implementation
+architecture lives in mlx-vlm upstream (>=0.7,<0.8) but *that* implementation
 expects a different checkpoint dialect — the oQ artifacts this fleet ships
 (oMLX-vendored convention: ``forget_gate.f_a_proj``, ``conv1d``, unfused
 ``q_proj``/``k_proj``/``v_proj``, ``vision_model.*`` tower) were converted
@@ -146,15 +146,23 @@ def mtp_impl(config: Dict[str, Any] | None = None):
         positions were never rolled back, and restored prefix caches kept
         tokens the engine then replayed on top of committed KV. ``offset``
         reports the KV half's token count (PoolingCache's ``offset`` is a
-        compressed-row count, not tokens); ``trim`` fans out to both halves,
-        where PoolingCache's armed undo covers multi-token rejections that
-        cross a pool window. Used for both the MTP draft cache and — via
-        ``glm_mtp_patch.make_cache`` — the vendored trunk pair.
+        compressed-row count, not tokens); ``trim`` is atomic: the pool
+        half can refuse (undo log exhausted at a window boundary), so it
+        trims first and the KV half mirrors only what it accepted — the
+        base ``CacheList.trim`` would trim KV and *then* return the pool's
+        refusal, desyncing the pair. Used for both the MTP draft cache
+        and — via ``glm_mtp_patch.make_cache`` — the vendored trunk pair.
         """
 
         @property
         def offset(self):
             return self.caches[0].offset
+
+        def trim(self, n):
+            m = self.caches[1].trim(n)
+            if m:
+                self.caches[0].trim(m)
+            return m
 
     tcfg = (config or {}).get("text_config", config or {})
     kpool = int(tcfg.get("index_kpool", 4) or 4)
@@ -170,7 +178,10 @@ def mtp_impl(config: Dict[str, Any] | None = None):
         # so session-bank restores can see and trim real token offsets.
         "cache_pair_cls": GLMOffsetCacheList,
         "return_array_mask": True,
-        "rewrite_mla_kv_b": False,
+        # BF16 exports keep the fused kv_b_proj; the MTP block's sparse
+        # attention wants the split embed_q/unembed_out names. No-op on oQ
+        # artifacts, which already ship the split leaves.
+        "rewrite_mla_kv_b": True,
         # glm5 checkpoints are VLM-wrapped: patch language_model, not model.
         # The remaining accessors then resolve on the patched language_model
         # itself (default .model / .lm_head / .model.embed_tokens shape).

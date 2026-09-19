@@ -130,7 +130,16 @@ class PoolingCache(_BaseCache):
                 )
             except Exception:
                 decode_consistent = False
-            if decode_consistent and getattr(self, "_undo_chain", False):
+            # MTPLX: cap the chained undo — a rejection trim never reaches
+            # back further than a verify window; an unbounded chain would
+            # pin O(generated) indexer rows in the graph.
+            chain = (
+                decode_consistent
+                and getattr(self, "_undo_chain", False)
+                and self._undo is not None
+                and self._undo[4].shape[1] + L <= 64
+            )
+            if chain:
                 undo = self._undo
                 self._undo = (
                     *undo[:4],

@@ -109,6 +109,7 @@ def test_rewrite_embedded_and_lm_head_lands_shared_head():
         "language_model.mtp.0.eh_proj.weight": object(),
         "language_model.mtp.0.norm.weight": object(),
         "language_model.mtp.0.block.mlp.gate.weight": object(),
+        "language_model.mtp.0.block.self_attn.embed_q.weight": object(),
         "language_model.lm_head.weight": sentinel,
         "language_model.lm_head.scales": object(),
     }
@@ -130,6 +131,7 @@ def test_rewrite_sidecar_dialect_also_maps():
         "mtp.0.eh_proj.weight": object(),
         "mtp.0.norm.weight": object(),
         "mtp.0.block.self_attn.q_a_proj.weight": object(),
+        "mtp.0.block.self_attn.embed_q.weight": object(),
         "lm_head.weight": object(),
     }
     args = SimpleNamespace(n_routed_experts=0)
@@ -155,6 +157,7 @@ def test_rewrite_bf16_appended_layer_dialect_maps():
         "model.language_model.layers.45.shared_head.norm.weight": object(),
         "model.language_model.layers.45.input_layernorm.weight": object(),
         "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight": object(),
+        "model.language_model.layers.45.self_attn.embed_q.weight": object(),
         "model.language_model.layers.45.mlp.gate.weight": object(),
         "lm_head.weight": sentinel,
     }
@@ -375,6 +378,7 @@ def test_rewrite_completeness_requires_shared_head():
         "language_model.mtp.0.hnorm.weight": object(),
         "language_model.mtp.0.eh_proj.weight": object(),
         "language_model.mtp.0.block.mlp.gate.weight": object(),
+        "language_model.mtp.0.block.self_attn.embed_q.weight": object(),
         # no lm_head.* / embed_tokens.* anywhere
     }
     args = SimpleNamespace(n_routed_experts=0)
@@ -393,6 +397,7 @@ def test_rewrite_tied_embedding_fills_shared_head():
         "language_model.mtp.0.hnorm.weight": object(),
         "language_model.mtp.0.eh_proj.weight": object(),
         "language_model.mtp.0.block.mlp.gate.weight": object(),
+        "language_model.mtp.0.block.self_attn.embed_q.weight": object(),
         "language_model.model.embed_tokens.weight": sentinel,
     }
     args = SimpleNamespace(n_routed_experts=0)
@@ -436,8 +441,79 @@ def test_trunk_pair_offset_gates_session_bank_trims():
     assert pool.remainder == 2
 
     # Wrapped pair at a pool window boundary with no undo log: the pool
-    # cannot give the token back, so the restore must decline cleanly.
+    # cannot give the token back, so the restore must decline cleanly —
+    # and the atomic pair trim must leave the KV half untouched (a
+    # refused trim that still shortened KV would desync the pair).
     kv2, pool2 = KVCache(), PoolingCache(4)
     kv2.offset = 6
     wrapped2 = pair_cls(kv2, pool2)
     assert _trim_cache_ref_to_prefix([wrapped2], 6) is False
+    assert kv2.offset == 6
+
+
+def test_trunk_pair_wrap_fires_on_vendored_cache_classes():
+    """Regression for the dead-wrap defect: the vendored ``make_cache``
+    builds ``mlx_vlm.models.cache.CacheList`` pairs, not the ``mlx_lm``
+    class — an isinstance-based wrap never fired. ``_needs_offset_wrap``
+    must duck-type both flavors."""
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_vlm")
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.cache import CacheList as VLMCacheList
+    from mlx_vlm.models.cache import KVCache as VLMKVCache
+    from mtplx.glm_mtp_patch import _needs_offset_wrap
+    from mtplx.models.glm5_next import mtp_impl
+    from mtplx.vendor.glm5_omlx.deepseek_v4.cache_extras import PoolingCache
+
+    impl = mtp_impl(_glm5_config())
+    pair_cls = impl["cache_pair_cls"]
+
+    # The vendored trunk pair shape: mlx_vlm CacheList of [KVCache, Pool].
+    vlm_pair = VLMCacheList(VLMKVCache(), PoolingCache(4))
+    assert _needs_offset_wrap(vlm_pair) is True
+    wrapped = pair_cls(*vlm_pair.caches)
+    assert wrapped.offset == 0
+    wrapped.caches[0].offset = 7
+    assert wrapped.offset == 7
+
+    # Linear-layer arrays are not pairs and must pass through untouched.
+    assert _needs_offset_wrap(ArraysCache(size=2)) is False
+
+    # Idempotent: an already-wrapped pair exposes offset and is skipped.
+    assert _needs_offset_wrap(wrapped) is False
+
+
+def test_kv_b_split_for_bf16_head_lands_embed_q():
+    """BF16 exports carry the fused ``kv_b_proj``; the MTP block's sparse
+    attention needs the split ``embed_q``/``unembed_out`` — the gate must
+    see them after rewrite_mla_kv_b, not an init-time projection."""
+    mx = pytest.importorskip("mlx.core")
+    import mlx.core  # noqa: F401
+
+    heads, qk_nope, v_head, kv_lora = 2, 4, 4, 8
+    fused = mx.random.normal((heads * (qk_nope + v_head), kv_lora))
+    raw = {
+        "model.language_model.layers.45.enorm.weight": object(),
+        "model.language_model.layers.45.hnorm.weight": object(),
+        "model.language_model.layers.45.eh_proj.weight": object(),
+        "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight": object(),
+        "model.language_model.layers.45.self_attn.kv_b_proj.weight": fused,
+        "model.language_model.layers.45.mlp.gate.weight": object(),
+        "lm_head.weight": object(),
+    }
+    args = SimpleNamespace(
+        n_routed_experts=0,
+        num_attention_heads=heads,
+        qk_nope_head_dim=qk_nope,
+        v_head_dim=v_head,
+        kv_lora_rank=kv_lora,
+    )
+    mapped = _rewrite_glm_mtp_weights(
+        raw, args=args, start_layer=45, num_mtp_layers=1, rewrite_mla_kv_b=True
+    )
+    embed_q = mapped["layers.0.mtp_block.self_attn.embed_q.weight"]
+    unembed_out = mapped["layers.0.mtp_block.self_attn.unembed_out.weight"]
+    assert embed_q.shape == (heads, kv_lora, qk_nope)
+    assert unembed_out.shape == (heads, v_head, kv_lora)
+    assert "layers.0.mtp_block.self_attn.kv_b_proj.weight" not in mapped
+    assert "layers.0.shared_head_head.weight" in mapped

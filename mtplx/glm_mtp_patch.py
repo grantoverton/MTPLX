@@ -130,6 +130,8 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
                 # (GLM-5.3 BF16 ships its appended MTP layer here).
                 f"model.language_model.layers.{start + i}.",
                 f"language_model.layers.{start + i}.",
+                # Text-only re-exports drop every model.* prefix entirely.
+                f"layers.{start + i}.",
             )
         )
         selected = {
@@ -226,7 +228,9 @@ def _rewrite_glm_mtp_weights(
     shared_lm_head: dict[str, Any] = {}
     embed_weight = None
     for key, value in raw.items():
-        key = key.removeprefix("language_model.")
+        # Normalize the VLM nesting dialects: ``language_model.`` (embedded
+        # oQ exports) and ``model.language_model.`` (HF/VLM BF16 exports).
+        key = key.removeprefix("model.language_model.").removeprefix("language_model.")
         if "rotary_emb.inv_freq" in key:
             continue
         if key in {"lm_head.weight", "lm_head.scales", "lm_head.biases"}:
@@ -253,22 +257,28 @@ def _rewrite_glm_mtp_weights(
             else:
                 mapped[rest] = value
             continue
-        if key.startswith("layers."):
-            mapped[key] = value
-            continue
+        # Appended decoder-layer dialects: the MTP block sits at layer
+        # indices [start_layer, start_layer+num_mtp_layers). After the
+        # prefix strip above, ``model.language_model.layers.N.`` and
+        # ``language_model.layers.N.`` both arrive as ``layers.N.``; HF
+        # exports keep ``model.layers.N.``.
+        appended_suffix = None
+        appended_idx = None
         for local_idx in range(num_mtp_layers):
             spec_idx = start_layer + local_idx
             for prefix in (
                 f"model.layers.{spec_idx}.",
-                f"model.language_model.layers.{spec_idx}.",
-                f"language_model.layers.{spec_idx}.",
+                f"layers.{spec_idx}.",
             ):
                 if key.startswith(prefix):
+                    appended_suffix = key.removeprefix(prefix)
+                    appended_idx = local_idx
                     break
-            else:
-                continue
-            suffix = key.removeprefix(prefix)
-            local_prefix = f"layers.{local_idx}"
+            if appended_suffix is not None:
+                break
+        if appended_suffix is not None:
+            suffix = appended_suffix
+            local_prefix = f"layers.{appended_idx}"
             if suffix.startswith("shared_head.norm."):
                 mapped[f"{local_prefix}.shared_head_norm.{suffix.removeprefix('shared_head.norm.')}"] = value
             elif suffix.startswith("shared_head.head."):
@@ -280,7 +290,10 @@ def _rewrite_glm_mtp_weights(
                 pass
             else:
                 mapped[f"{local_prefix}.mtp_block.{suffix}"] = value
-            break
+            continue
+        if key.startswith("layers."):
+            mapped[key] = value
+            continue
 
     for local_idx in range(num_mtp_layers):
         block_prefix = f"layers.{local_idx}.mtp_block"
@@ -321,6 +334,11 @@ def _has_complete_glm_mtp_payload(
             f"{prefix}hnorm.weight",
             f"{prefix}eh_proj.weight",
             f"{prefix}shared_head_head.weight",
+            # Post-rewrite this exists whenever the checkpoint carried MLA
+            # attention (embed_q leaves or a fused kv_b_proj that was just
+            # split). Without it the draft output projection stays at init —
+            # the same silent zero-acceptance class the lm_head gate fences.
+            f"{prefix}mtp_block.self_attn.embed_q.weight",
         )
         if not all(key in weights for key in required):
             return False
@@ -377,11 +395,22 @@ def _quantize_for_loaded_weights(mtp: Any, config: dict[str, Any], weights: dict
             else:
                 in_features = int(packed.shape[-1]) * 32 // bits
                 derived = in_features // int(scales.shape[-1])
-                group_size = (
-                    derived
-                    if in_features % int(scales.shape[-1]) == 0
-                    else int(quantization["group_size"])
-                )
+                if in_features % int(scales.shape[-1]) == 0:
+                    group_size = derived
+                else:
+                    # A wrong group size dequantizes garbage while the load
+                    # still succeeds — same silent-miss class the
+                    # shared_head_head gate fences, so make it loud.
+                    logger.warning(
+                        "[GLM MTP inject] %s: derived group_size %d does not "
+                        "divide evenly (in=%d scales=%d); falling back to %d",
+                        path,
+                        derived,
+                        in_features,
+                        int(scales.shape[-1]),
+                        int(quantization["group_size"]),
+                    )
+                    group_size = int(quantization["group_size"])
         return {
             "group_size": int(group_size),
             "bits": bits,
@@ -400,6 +429,20 @@ def _quantize_for_loaded_weights(mtp: Any, config: dict[str, Any], weights: dict
         mode=quantization.get("mode", "affine"),
         class_predicate=class_predicate,
     )
+
+
+def _needs_offset_wrap(entry: Any) -> bool:
+    """True when a trunk cache entry is a list-of-caches pair with no
+    ``offset`` — i.e. the bare CacheList the vendored ``make_cache`` emits.
+
+    Duck-typed deliberately: the vendored tree builds
+    ``mlx_vlm.models.cache.CacheList`` while the draft factory builds the
+    ``mlx_lm`` flavor; an isinstance check on either class silently never
+    fires for the other. ``ArraysCache`` (linear layers) has no ``.caches``
+    and stays untouched; an already-wrapped pair exposes ``offset`` and is
+    skipped.
+    """
+    return hasattr(entry, "caches") and not hasattr(entry, "offset")
 
 
 def _make_glm_mtp_module(config: dict[str, Any], args: Any):
@@ -471,7 +514,17 @@ def inject_glm_mtp_support(
     impl = _glm_impl(config)
     target_model = impl.get("mtp_target", lambda m: m)(model)
     trunk_getter = impl.get("trunk", lambda m: m.model)
-    lm_head_getter = impl.get("lm_head", lambda m: m.lm_head)
+
+    def _default_lm_head(m):
+        # Tied-embedding checkpoints have no lm_head module; the output
+        # projection is the embedding table itself (matches the vendored
+        # tie_word_embeddings path).
+        lm_head = getattr(m, "lm_head", None)
+        if lm_head is not None:
+            return lm_head
+        return m.model.embed_tokens.as_linear
+
+    lm_head_getter = impl.get("lm_head", _default_lm_head)
     embed_getter = impl.get("embed_tokens", lambda m: m.model.embed_tokens)
     args = getattr(target_model, "args", None) or getattr(model, "args", None)
     if args is None:
@@ -503,10 +556,11 @@ def inject_glm_mtp_support(
     class _MTPLXGLMModel(original_outer_class):
         def __call__(
             self,
-            inputs,
+            inputs=None,
             cache=None,
             return_hidden: bool = False,
             input_embeddings=None,
+            inputs_embeds=None,
             hidden_variant: str | None = None,
             emit_logits: bool = True,
             logits_keep: int = 0,
@@ -514,15 +568,16 @@ def inject_glm_mtp_support(
         ):
             if input_embeddings is not None:
                 raise ValueError("GLM MTP backend does not support input_embeddings")
-            hidden = trunk_getter(self)(inputs, cache)
+            if inputs is None:
+                inputs = kwargs.get("input_ids")
+            hidden = trunk_getter(self)(inputs, cache, inputs_embeds=inputs_embeds)
             if not emit_logits:
                 # Sustained-prefill contract: a cache-only chunk skips the
                 # [1, S, vocab] head matmul (~634 MB + 2.6 TFLOP per 2048
                 # tokens at GLM-5.3's 154880 vocab).
                 return (None, hidden) if return_hidden else None
-            head_in = (
-                hidden[:, -max(1, int(logits_keep)) :] if logits_keep else hidden
-            )
+            keep = int(logits_keep or kwargs.get("num_logits_to_keep") or 0)
+            head_in = hidden[:, -max(1, keep) :] if keep else hidden
             logits = lm_head_getter(self)(head_in)
             if not return_hidden:
                 return logits
@@ -548,18 +603,26 @@ def inject_glm_mtp_support(
             layer_cache = None
             if mtp_cache is not None:
                 layer_cache = mtp_cache[depth] if isinstance(mtp_cache, list) else mtp_cache
-            # Arm PoolingCache undo for this draft/verify forward so a later
-            # rejection trim can roll the pool back (see cache_rollback).
+            # Arm PoolingCache undo only for speculative forwards (draft
+            # proposals emit logits; ``mtp_update_cache`` history replay
+            # does not). Committed-token appends are never trimmed back, so
+            # arming them would just grow the undo chain O(generated).
             from mtplx.vendor.glm5_omlx.cache_rollback import pool_undo_arm
 
-            with pool_undo_arm():
-                logits, hidden = self.mtp.layers[depth](
+            def run_layer():
+                return self.mtp.layers[depth](
                     next_token_ids,
                     hidden_states,
                     embed_tokens=embed_getter(self),
                     cache=layer_cache,
                     emit_logits=emit_logits,
                 )
+
+            if emit_logits:
+                with pool_undo_arm():
+                    logits, hidden = run_layer()
+            else:
+                logits, hidden = run_layer()
             if not return_hidden:
                 return logits
             return logits, hidden
@@ -609,12 +672,9 @@ def inject_glm_mtp_support(
                     # span, and the engine replays boundary tokens on top of
                     # committed KV — restored generations diverge. Re-wrap
                     # each pair so restores see and trim real offsets.
-                    from mlx_lm.models.cache import CacheList
-
                     caches = [
                         pair_cls(*entry.caches)
-                        if isinstance(entry, CacheList)
-                        and not hasattr(entry, "offset")
+                        if _needs_offset_wrap(entry)
                         else entry
                         for entry in caches
                     ]
