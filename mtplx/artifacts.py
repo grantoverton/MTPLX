@@ -201,6 +201,8 @@ def is_appended_layer_mtp_key(key: str, config: dict[str, Any]) -> bool:
             # model.language_model.layers.{N}.* (GLM-5.3 BF16).
             f"model.language_model.layers.{index}.",
             f"language_model.layers.{index}.",
+            # Text-only re-exports drop every model.* prefix entirely.
+            f"layers.{index}.",
         )
     )
 

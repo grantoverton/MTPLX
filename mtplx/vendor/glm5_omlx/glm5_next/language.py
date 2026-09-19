@@ -447,11 +447,14 @@ class Glm5NextIndexer(nn.Module):
 
         chunk = 512 if S > 512 else S
         out = []
+        # MTPLX: weights_proj is per-token — project once for the whole
+        # sequence instead of re-dispatching inside every 512-row chunk.
+        weights_full = linear_forward(self.weights_proj, x)
         for c0 in range(0, S, chunk):
             c1 = min(c0 + chunk, S)
             cs = c1 - c0
             q_chunk = q[:, c0:c1]
-            weights = linear_forward(self.weights_proj, x[:, c0:c1])
+            weights = weights_full[:, c0:c1]
             weights = (weights * self.weight_scale).astype(q_chunk.dtype)
             index_scores = self._native_scores(q_chunk, pool_keys, weights)
             if index_scores is None:
@@ -932,6 +935,25 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # MTPLX: appended-layer MTP dialects (GLM-5.3 BF16) park the head at
+        # decoder index >= num_hidden_layers; the trunk module is built
+        # without it, so drop those keys here instead of letting them reach
+        # load_weights.
+        n_layers = int(getattr(self.args, "num_hidden_layers", 0) or 0)
+        if n_layers:
+
+            def _is_appended(key):
+                for prefix in (
+                    "language_model.model.layers.",
+                    "model.layers.",
+                    "layers.",
+                ):
+                    if key.startswith(prefix):
+                        idx = key[len(prefix) :].partition(".")[0]
+                        return idx.isdigit() and int(idx) >= n_layers
+                return False
+
+            weights = {k: v for k, v in weights.items() if not _is_appended(k)}
         weights = DSV32Model.sanitize(self, weights)
 
         remapped = {}

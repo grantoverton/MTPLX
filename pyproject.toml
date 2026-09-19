@@ -104,9 +104,10 @@ include = ["mtplx*", "vllm_metal*"]
 mtplx = ["templates/**/*.jinja", "data/*.npy"]
 "mtplx.benchmarks" = ["prompts/*.jsonl"]
 "mtplx.dashboard" = ["_static/**/*"]
-# Vendored glm5_omlx native-kernel sources + provenance must ship in the
-# wheel: fast.py compiles the csrc tree at first use on machines without
-# the prebuilt .metallib.
+# Vendored glm5_omlx native-kernel sources + provenance ship in the wheel so
+# a source install can build _ext per the vendored README (there is no
+# first-use auto-compile: without the prebuilt .so the kernels fall back to
+# mx.fast / Python paths and /health glm5_native reports it).
 "mtplx.vendor.glm5_omlx" = ["LICENSE", "README.md"]
 "mtplx.vendor.glm5_omlx.glm_moe_dsa" = ["csrc/**/*"]
 "mtplx.vendor.glm5_omlx.common" = ["csrc/**/*"]

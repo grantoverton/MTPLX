@@ -5,8 +5,19 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+# MTPLX: omlx is an optional accelerator, never a dependency — resolve it
+# once here instead of paying an ImportError per quantized matmul.
+try:
+    from omlx.custom_kernels.qwen35_prefill import fast as _omlx_fast
+    from omlx.patches.qwen35_q4_mlp import _is_supported_affine_linear
+except Exception:  # pragma: no cover - depends on a co-installed omlx
+    _omlx_fast = None
+    _is_supported_affine_linear = None
+
 
 def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
+    if _omlx_fast is None or _is_supported_affine_linear is None:
+        return None
     bits = int(getattr(linear, "bits", 0) or 0)
     group_size = int(getattr(linear, "group_size", 0) or 0)
     if bits not in (2, 4, 5, 6, 8) or group_size not in (64, 128):
@@ -18,16 +29,13 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
         return None
 
     try:
-        from omlx.patches.qwen35_q4_mlp import _is_supported_affine_linear
-        from omlx.custom_kernels.qwen35_prefill import fast
-
         name = f"qwen35_q{bits}_affine_qmm_t"
-        if not fast.has_symbol(name) or not _is_supported_affine_linear(linear, x):
+        if not _omlx_fast.has_symbol(name) or not _is_supported_affine_linear(linear, x):
             return None
         # The tile indexes x as row-major packed and ignores its strides, so a
         # last-axis view reads the wrong lanes.
         x = mx.contiguous(x)
-        return getattr(fast, name)(
+        return getattr(_omlx_fast, name)(
             x,
             linear.weight,
             linear.scales,
@@ -35,7 +43,7 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
             8,
             group_size,
         )
-    except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
+    except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
 
 
@@ -86,13 +94,15 @@ def fused_quantized_matmul(
         and x.shape[-1] % 64 == 0
     ):
         try:
-            from omlx.custom_kernels.qwen35_prefill import fast
-
             name = f"qwen35_q{bits}_affine_qmm_t"
-            if fast.has_symbol(name) and fast.qmm_supports_group_size(group_size):
+            if (
+                _omlx_fast is not None
+                and _omlx_fast.has_symbol(name)
+                and _omlx_fast.qmm_supports_group_size(group_size)
+            ):
                 # The tile ignores the input's strides. See _native_qmm.
                 x = mx.contiguous(x)
-                return getattr(fast, name)(
+                return getattr(_omlx_fast, name)(
                     x,
                     weight,
                     scales,
@@ -100,7 +110,7 @@ def fused_quantized_matmul(
                     8,
                     group_size,
                 )
-        except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
+        except (AttributeError, RuntimeError, TypeError, ValueError):
             pass
     return mx.quantized_matmul(
         x,

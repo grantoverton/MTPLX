@@ -3268,17 +3268,46 @@ def _forge_verify_depths(model_path: Path) -> tuple[int, ...]:
     Backends do not all reach D3. MiMo drafts one token per step, so a fixed
     1,2,3 makes tune reject the whole run with "tune depths must be one of 1".
     """
-    from mtplx.backends.descriptors import tune_policy_for_model
+    from mtplx.backends.descriptors import (
+        GLM5_NEXT_DESCRIPTOR,
+        descriptor_for_architecture_id,
+        tune_policy_for_model,
+    )
 
+    semantics = None
+    try:
+        cfg = json.loads((Path(model_path) / "config.json").read_text())
+        arch = cfg.get("mtp_arch") or (cfg.get("compatibility") or {}).get("arch_id")
+        descriptor = descriptor_for_architecture_id(arch)
+        if descriptor is None:
+            # Forged artifacts declare model_type, not arch metadata.
+            mt = str(cfg.get("model_type") or "")
+            tmt = str((cfg.get("text_config") or {}).get("model_type") or "")
+            if mt in {"glm5_next", "glm5_next_text"} or tmt in {
+                "glm5_next",
+                "glm5_next_text",
+            }:
+                descriptor = GLM5_NEXT_DESCRIPTOR
+        semantics = getattr(descriptor, "draft_semantics", None)
+    except Exception:
+        semantics = None
     try:
         policy = tune_policy_for_model(model_ref=str(model_path))
     except Exception:
-        return DEFAULT_FORGE_VERIFY_DEPTHS
+        policy = None
     depths = tuple(
         int(candidate[1:])
         for candidate in getattr(policy, "candidates", ())
         if str(candidate).startswith("D") and str(candidate)[1:].isdigit()
     )
+    if semantics is not None and semantics.unit == "depth":
+        # The declared depth range is authoritative when the tune policy
+        # names no candidates (glm5_next's TunePolicy is intentionally
+        # empty); an empty-policy fallback to (1,2,3) agreeing with the
+        # descriptor today is luck, not a contract. Intersect candidates
+        # with the declared range so drift fails visibly, not silently.
+        supported = tuple(range(int(semantics.minimum), int(semantics.maximum) + 1))
+        depths = tuple(d for d in depths if d in supported) or supported
     return depths or DEFAULT_FORGE_VERIFY_DEPTHS
 
 

@@ -3,7 +3,7 @@
 Autoregressive serving rides the in-tree ``mtplx.models.glm5_next`` wrapper
 around mlx-vlm's implementation. The speculative path loads through the shared
 ``mtplx.runtime`` contract gate; MTP execution is wired through
-``generation.py`` plus ``mtplx/glm5_next_patch.py`` (the port of oMLX's
+``generation.py`` plus ``mtplx/glm_mtp_patch.py`` (the port of oMLX's
 ``glm5_next_vlm_runtime`` — MTP block attach, ``mtp_forward``,
 ``make_mtp_cache``, KDA replay-rollback, PoolingCache undo).
 """
@@ -43,10 +43,10 @@ class Glm5NextMTPBackend(MTPBackend):
     def health(self) -> dict[str, Any]:
         return {
             "arch_id": self.arch_id,
-            "runtime_path": "mtplx.runtime + mtplx.glm5_next_patch + mtplx.generation",
+            "runtime_path": "mtplx.runtime + mtplx.glm_mtp_patch + mtplx.generation",
             "support_level": "experimental-native-contract-gated",
             "contract_required": True,
-            "requires": "mlx-vlm>=0.6.17",
+            "requires": "mlx-vlm>=0.7,<0.8",
             "supported_model_types": ["glm5_next", "glm5_next_text"],
             "references": [
                 "REFERENCES:mlx-vlm/mlx_vlm/models/glm5_next/language.py",

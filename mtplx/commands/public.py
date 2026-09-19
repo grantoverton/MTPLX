@@ -1360,30 +1360,21 @@ def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
 def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
     descriptor = descriptor_from_inspection(inspection)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if _inspection_backend_id(inspection) == "glm5_next":
-        # Same shape as qwen4_exp: the capture-commit verifier reimplements
-        # the trunk forward against qwen3-next module names (.linear_attn,
-        # 3-D hidden, plain residuals). glm5_next is 4-D HyperConnection +
-        # vendored KDA/DSA internals — batched verify snapshots/restores the
-        # recurrent caches generically instead.
-        if "verify-strategy" not in cli_flags:
-            args.verify_strategy = "batched"
-    if _inspection_backend_id(inspection) == "qwen4_exp":
-        # Flash-Next verify defaults: the capture-commit verifier walks the
-        # qwen3-next GDN internals, which this family's own GDN classes do
-        # not expose — batched verify snapshots/restores the recurrent caches
-        # generically. A family-native capture backend replaces this default
-        # when it lands. Depth follows the family DraftSemantics ceiling (3)
-        # with the adaptive expected_value policy owning per-step depth —
-        # the 27B contract (founder, 2026-08-26); no static clamp here.
-        if "verify-strategy" not in cli_flags:
-            args.verify_strategy = "batched"
-        # Target + draft sampler flow from the qwen4_exp family policy
-        # (QWEN4_EXP_SAMPLER_DEFAULTS: the model-card thinking-mode set) via
-        # the standard sampler block below. The 08-27 draft-temp 0.1 receipt
-        # was measured at target 0.6 and is superseded by the advised
-        # target-1.0 contract; re-calibrate draft temp under target 1.0
-        # before pinning any non-identity value.
+    backend_id = _inspection_backend_id(inspection)
+    if backend_id in {"glm5_next", "qwen4_exp"} and "verify-strategy" not in cli_flags:
+        # The capture-commit verifier reimplements the trunk forward against
+        # module names neither family exposes (glm5: 4-D HyperConnection +
+        # vendored KDA/DSA; qwen4: qwen3-next GDN internals) — batched verify
+        # snapshots/restores the recurrent caches generically instead.
+        # (qwen4 depth follows the family DraftSemantics ceiling of 3 with
+        # the adaptive expected_value policy owning per-step depth — the 27B
+        # contract, founder 2026-08-26; no static clamp here. Its target +
+        # draft sampler flows from the qwen4_exp family policy via the
+        # standard sampler block below; the 08-27 draft-temp 0.1 receipt was
+        # measured at target 0.6 and is superseded by the advised target-1.0
+        # contract — re-calibrate draft temp under target 1.0 before pinning
+        # any non-identity value.)
+        args.verify_strategy = "batched"
     # Family-aware policy, not the raw lane descriptor: shared lanes (mlx_lm_ar)
     # pin parser=none while a family on that lane (lfm2) has a verified codec.
     # Stamping the lane's "none" here reads as an operator override downstream
