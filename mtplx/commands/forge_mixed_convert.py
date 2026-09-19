@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -52,18 +53,30 @@ def build_predicate(recipe: dict[str, Any]) -> Callable[[str, Any], bool | dict[
             }
         overrides.append((suffix, layer_set, params))
 
+    hits = [0] * len(overrides)
+
     def predicate(path: str, module: Any) -> bool | dict[str, Any]:
         del module
-        for suffix, layer_set, params in overrides:
+        for index, (suffix, layer_set, params) in enumerate(overrides):
             if not path.endswith(suffix):
                 continue
             if layer_set is not None:
                 match = _LAYER_INDEX_RE.search(path)
                 if match is None or int(match.group(1)) not in layer_set:
                     continue
+            hits[index] += 1
             return dict(params) if isinstance(params, dict) else params
         return True
 
+    # Zero-hit overrides silently degrade to body precision (e.g. a suffix
+    # written for checkpoint keys when predicates match module paths —
+    # kv_b_proj vs the vendored split embed_q/unembed_out); surface them.
+    predicate.override_labels = [
+        suffix
+        + (f" (layers {sorted(layer_set)})" if layer_set is not None else "")
+        for suffix, layer_set, _ in overrides
+    ]
+    predicate.override_hits = hits
     return predicate
 
 
@@ -104,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         _register_vendored_architectures()
     from mlx_lm.convert import convert
 
+    predicate = build_predicate(recipe)
     convert(
         hf_path=args.source,
         mlx_path=args.destination,
@@ -112,8 +126,16 @@ def main(argv: list[str] | None = None) -> int:
         q_group_size=int(recipe.get("body_group_size") or 64),
         q_mode=str(recipe.get("body_mode") or "affine"),
         dtype=args.dtype,
-        quant_predicate=build_predicate(recipe),
+        quant_predicate=predicate,
     )
+    labels = getattr(predicate, "override_labels", [])
+    hits = getattr(predicate, "override_hits", [])
+    for label, count in zip(labels, hits):
+        if count == 0:
+            print(
+                f"[forge-mixed] WARNING: override matched no modules: {label}",
+                file=sys.stderr,
+            )
     return 0
 
 
