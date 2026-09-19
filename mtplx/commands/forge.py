@@ -2860,7 +2860,6 @@ def _run_verify_family_serve(
                     )
                 return stats
 
-            _measure("mtp", "warmup")  # first-load warm; discarded
             try:
                 from mtplx.backends.descriptors import draft_semantics_for_model
 
@@ -2874,6 +2873,7 @@ def _run_verify_family_serve(
                 )
             except Exception:
                 mtp_request_field = "depth"
+            _measure("mtp", "warmup")  # first-load warm; discarded
             # Verification requires a row per declared depth
             # (_verify_rows_have_all_depths); families whose tune lane cannot
             # drive them still owe the full declared range through serve.

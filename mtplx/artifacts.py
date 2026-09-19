@@ -458,18 +458,11 @@ def mtp_weights_present_on_disk(
     if any(is_mtp_key(k) for k in keys):
         return True
 
-    # 3. DeepSeek-style trailing MTP decoder layer(s) appended after the trunk:
-    #    model.layers.{num_hidden_layers + i}.*
-    start = int(
-        text_config(config).get("num_hidden_layers")
-        or config.get("num_hidden_layers")
-        or 0
-    )
-    count = _num_mtp_layers(config)
-    if start and count:
-        wanted = tuple(f"model.layers.{start + i}." for i in range(count))
-        if any(k.startswith(wanted) for k in keys):
-            return True
+    # 3. Trailing MTP decoder layer(s) appended after the trunk, under any
+    #    known prefix (model.layers.* / model.language_model.layers.* /
+    #    language_model.layers.* — the last two are the GLM-5.3 BF16 dialect).
+    if any(is_appended_layer_mtp_key(k, config) for k in keys):
+        return True
 
     return False
 

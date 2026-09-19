@@ -1,4 +1,4 @@
-"""Runtime MTP injection for GLM-4 MoE-family MLX models."""
+"""Runtime MTP injection for GLM-4 MoE and GLM-5.3 (``glm5_next``) MLX models."""
 
 from __future__ import annotations
 
@@ -44,14 +44,9 @@ def _glm_impl(config: dict[str, Any]) -> dict[str, Any]:
         from mtplx.models.glm5_next import mtp_impl
 
         # mtp_impl installs the vendored PoolingCache shim when the running
-        # mlx-lm predates it (PR 1192), so this import must follow the call.
-        impl = mtp_impl()
-        from mlx_lm.models.cache import CacheList, KVCache, PoolingCache
-
-        tcfg = text_config(config)
-        kpool = int(tcfg.get("index_kpool", 4) or 4)
-        impl["cache_factory"] = lambda: CacheList(KVCache(), PoolingCache(kpool))
-        return impl
+        # mlx-lm predates it (PR 1192); its cache_factory is already the
+        # zero-arg draft-cache factory bound to this config's index_kpool.
+        return mtp_impl(config)
     if model_type == "glm4_moe_lite":
         from mlx_lm.models import glm4_moe_lite as impl
         from mlx_lm.models.cache import KVCache
@@ -93,6 +88,9 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
         # A configured sidecar carries the head block only; the shared
         # lm_head that feeds shared_head_head still lives in the trunk
         # shards, so the draft output projection needs those files too.
+        # Quantized heads keep weight/scales/biases as three keys that an
+        # index is free to place in different shards, so match every
+        # lm_head.* leaf, not just .weight.
         index_path = model_path / "model.safetensors.index.json"
         if index_path.exists():
             try:
@@ -101,11 +99,18 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
                 weight_map = {}
             for rel in sorted({
                 rel for key, rel in weight_map.items()
-                if str(key).endswith("lm_head.weight")
+                if ".lm_head." in str(key) or str(key).startswith("lm_head.")
             }):
                 shard = model_path / rel
                 if shard not in files:
                     files.append(shard)
+        else:
+            # Single-file artifacts carry no index: the trunk's lone shard
+            # holds the lm_head the sidecar lacks.
+            files.extend(
+                shard for shard in sorted(model_path.glob("model*.safetensors"))
+                if shard != mtp_file
+            )
         return files
 
     index_path = model_path / "model.safetensors.index.json"
@@ -116,7 +121,17 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
             weight_map = {}
         start = int(text_config(config).get("num_hidden_layers") or config.get("num_hidden_layers") or 0)
         count = _num_mtp_layers(config)
-        wanted_prefixes = tuple(f"model.layers.{start + i}." for i in range(count))
+        wanted_prefixes = tuple(
+            prefix
+            for i in range(count)
+            for prefix in (
+                f"model.layers.{start + i}.",
+                # HF/VLM exports nest the decoder stack one level deeper
+                # (GLM-5.3 BF16 ships its appended MTP layer here).
+                f"model.language_model.layers.{start + i}.",
+                f"language_model.layers.{start + i}.",
+            )
+        )
         selected = {
             model_path / rel
             for key, rel in weight_map.items()
@@ -130,12 +145,13 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
                 for key, rel in weight_map.items()
                 if ".mtp." in str(key) or str(key).startswith("mtp.")
             }
-            # The shared lm_head feeds the MTP block's shared_head_head.
-            selected.update(
-                model_path / rel
-                for key, rel in weight_map.items()
-                if str(key).endswith("lm_head.weight")
-            )
+        # The shared lm_head feeds the MTP block's shared_head_head in both
+        # dialects; its quantized leaves can sit in separate shards.
+        selected.update(
+            model_path / rel
+            for key, rel in weight_map.items()
+            if ".lm_head." in str(key) or str(key).startswith("lm_head.")
+        )
         if selected:
             return sorted(selected)
 
@@ -208,12 +224,16 @@ def _rewrite_glm_mtp_weights(
 ) -> dict[str, Any]:
     mapped: dict[str, Any] = {}
     shared_lm_head: dict[str, Any] = {}
+    embed_weight = None
     for key, value in raw.items():
         key = key.removeprefix("language_model.")
         if "rotary_emb.inv_freq" in key:
             continue
         if key in {"lm_head.weight", "lm_head.scales", "lm_head.biases"}:
             shared_lm_head[key.removeprefix("lm_head.")] = value
+            continue
+        if key.endswith("embed_tokens.weight"):
+            embed_weight = value
             continue
         if key.startswith("mtp."):
             # Embedded dialect: mtp.{i}.{enorm,hnorm,eh_proj,norm,block.*} ->
@@ -268,6 +288,10 @@ def _rewrite_glm_mtp_weights(
             _rewrite_kv_b_projection(mapped, block_prefix, args)
         _stack_moe_experts(mapped, block_prefix, args)
         if f"layers.{local_idx}.shared_head_head.weight" not in mapped:
+            if not shared_lm_head and embed_weight is not None:
+                # Tied-embedding checkpoints carry no lm_head.* tensor; the
+                # output projection is the embedding table itself.
+                shared_lm_head["weight"] = embed_weight
             for leaf, value in shared_lm_head.items():
                 mapped[f"layers.{local_idx}.shared_head_head.{leaf}"] = value
 
@@ -282,7 +306,13 @@ def _has_complete_glm_mtp_payload(
     *,
     num_mtp_layers: int,
 ) -> bool:
-    """Return true only when every declared GLM MTP layer has real layer weights."""
+    """Return true only when every declared GLM MTP layer has real layer weights.
+
+    ``shared_head_head.weight`` is required: it is filled from the shared
+    lm_head AFTER the per-key mapping, so a load that silently misses the
+    lm_head (the zero-acceptance defect this check exists to fence) would
+    otherwise pass with an uninitialized draft output projection.
+    """
 
     for local_idx in range(num_mtp_layers):
         prefix = f"layers.{local_idx}."
@@ -290,6 +320,7 @@ def _has_complete_glm_mtp_payload(
             f"{prefix}enorm.weight",
             f"{prefix}hnorm.weight",
             f"{prefix}eh_proj.weight",
+            f"{prefix}shared_head_head.weight",
         )
         if not all(key in weights for key in required):
             return False
@@ -473,12 +504,22 @@ def inject_glm_mtp_support(
             return_hidden: bool = False,
             input_embeddings=None,
             hidden_variant: str | None = None,
+            emit_logits: bool = True,
+            logits_keep: int = 0,
             **kwargs,
         ):
             if input_embeddings is not None:
                 raise ValueError("GLM MTP backend does not support input_embeddings")
             hidden = trunk_getter(self)(inputs, cache)
-            logits = lm_head_getter(self)(hidden)
+            if not emit_logits:
+                # Sustained-prefill contract: a cache-only chunk skips the
+                # [1, S, vocab] head matmul (~634 MB + 2.6 TFLOP per 2048
+                # tokens at GLM-5.3's 154880 vocab).
+                return (None, hidden) if return_hidden else None
+            head_in = (
+                hidden[:, -max(1, int(logits_keep)) :] if logits_keep else hidden
+            )
+            logits = lm_head_getter(self)(head_in)
             if not return_hidden:
                 return logits
             return logits, hidden
@@ -502,12 +543,17 @@ def inject_glm_mtp_support(
             layer_cache = None
             if mtp_cache is not None:
                 layer_cache = mtp_cache[depth] if isinstance(mtp_cache, list) else mtp_cache
-            logits, hidden = self.mtp.layers[depth](
-                next_token_ids,
-                hidden_states,
-                embed_tokens=embed_getter(self),
-                cache=layer_cache,
-            )
+            # Arm PoolingCache undo for this draft/verify forward so a later
+            # rejection trim can roll the pool back (see cache_rollback).
+            from mtplx.vendor.glm5_omlx.cache_rollback import pool_undo_arm
+
+            with pool_undo_arm():
+                logits, hidden = self.mtp.layers[depth](
+                    next_token_ids,
+                    hidden_states,
+                    embed_tokens=embed_getter(self),
+                    cache=layer_cache,
+                )
             if not return_hidden:
                 return logits
             return logits, hidden
@@ -560,8 +606,16 @@ def inject_glm_mtp_support(
                 inputs_embeds=None,
                 mask=None,
                 return_hidden: bool = False,
+                pixel_values=None,
                 **kwargs,
             ):
+                if pixel_values is not None:
+                    # MTP-injected forwards are text-only; silently dropping
+                    # vision inputs would produce wrong outputs, not an error.
+                    raise ValueError(
+                        "GLM MTP injection does not support pixel_values; "
+                        "serve the vision request on a non-MTP backend"
+                    )
                 return self.language_model(
                     inputs,
                     inputs_embeds=inputs_embeds,

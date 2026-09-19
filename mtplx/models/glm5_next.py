@@ -15,11 +15,12 @@ dependency packages (``glm_moe_dsa`` sparse-MLA/DSA helpers and
 optional: every ``omlx.custom_kernels.*`` import falls back to ``mx.fast``
 or a pure-MLX path when absent.
 
-Two load-time adaptations happen in ``Model.sanitize``:
+One load-time adaptation happens in ``Model.sanitize``:
 
-* ``language_model.mtp.*`` — the nextn MTP block's 59 tensors have no module
-  to land on in the AR path. They are stashed on ``model._mtp_weight_stash``
-  (keyed minus the ``language_model.`` prefix) for the Phase-2 attach.
+* ``language_model.mtp.*`` — the nextn MTP block's tensors have no module to
+  land on in the AR path and are dropped from the trunk load; the Phase-2
+  attach (``glm_mtp_patch.inject_glm_mtp_support``) reloads them from disk
+  through ``_candidate_weight_files``.
 * Quantization dict keys are already module-tree paths (the vendored tree
   keeps the unfused names), so ``config["quantization"]`` resolves directly.
 
@@ -44,8 +45,14 @@ def _install_pooling_cache() -> None:
         lm_cache.PoolingCache = PoolingCache
 
 
+_MODEL_CLASSES_CACHE: tuple[type, type] | None = None
+
+
 def model_classes() -> tuple[type, type]:
     """Return (Model, ModelArgs) for the vendored glm5_next tree."""
+    global _MODEL_CLASSES_CACHE
+    if _MODEL_CLASSES_CACHE is not None:
+        return _MODEL_CLASSES_CACHE
     _install_pooling_cache()
 
     from mtplx.vendor.glm5_omlx.glm5_next.config import (
@@ -57,14 +64,11 @@ def model_classes() -> tuple[type, type]:
 
     class Model(_VLMModel):
         def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
-            stash: Dict[str, Any] = {}
-            remapped: Dict[str, Any] = {}
-            for key, value in weights.items():
-                if key.startswith("language_model.mtp."):
-                    stash[key[len("language_model.") :]] = value
-                    continue
-                remapped[key] = value
-            self._mtp_weight_stash = stash
+            remapped = {
+                key: value
+                for key, value in weights.items()
+                if not key.startswith("language_model.mtp.")
+            }
             return super().sanitize(remapped)
 
     class ModelArgs(ModelConfig):
@@ -79,14 +83,15 @@ def model_classes() -> tuple[type, type]:
                 params["vision_config"] = VisionConfig.from_dict(vc)
             return super().from_dict(params)
 
-    return Model, ModelArgs
+    _MODEL_CLASSES_CACHE = (Model, ModelArgs)
+    return _MODEL_CLASSES_CACHE
 
 
 # ``mtplx.runtime._model_classes_for_config`` calls the registered loader,
 # which lands here.
 
 
-def mtp_impl():
+def mtp_impl(config: Dict[str, Any] | None = None):
     """``glm_mtp_patch._glm_impl`` entry for the vendored glm5_next tree.
 
     The GLM-5.3 MTP head is a single plain decoder block (no HyperConnection):
@@ -130,13 +135,28 @@ def mtp_impl():
             x = x + self.self_attn(self.input_layernorm(x), mask, cache)
             return x + self.mlp(self.post_attention_layernorm(x))
 
-    def cache_factory(config):
-        kpool = int(getattr(config, "index_kpool", 4) or 4)
+    class _GLMMTPDraftCache(CacheList):
+        """CacheList exposing the engine's rollback surface for the draft head.
 
-        def factory():
-            return CacheList(KVCache(), PoolingCache(kpool))
+        ``generation._mtp_cache_offset`` / ``_rollback_mtp_cache`` read
+        ``mtp_cache[0].offset`` and call ``trim(n)``. A plain CacheList has
+        ``trim`` (delegated to both halves) but no ``offset``, so the
+        recorded base offset stayed 0 and rejected draft positions were never
+        rolled back — acceptance decayed with output length. ``offset``
+        reports the KV half's token count; ``trim`` fans out to both halves,
+        where PoolingCache's armed undo covers multi-token rejections that
+        cross a pool window.
+        """
 
-        return factory
+        @property
+        def offset(self):
+            return self.caches[0].offset
+
+    tcfg = (config or {}).get("text_config", config or {})
+    kpool = int(tcfg.get("index_kpool", 4) or 4)
+
+    def cache_factory():
+        return _GLMMTPDraftCache(KVCache(), PoolingCache(kpool))
 
     return {
         "args_cls": TextConfig,
@@ -153,6 +173,4 @@ def mtp_impl():
         "mask_cache": lambda cache: cache[0]
         if isinstance(cache, CacheList)
         else cache,
-        # Weight dialect: language_model.mtp.{i}.{enorm,hnorm,eh_proj,norm,block.*}
-        "embedded_mtp_prefix": "language_model.mtp.",
     }

@@ -283,7 +283,26 @@ class PoolingCache(_BaseCache):
 
     @meta_state.setter
     def meta_state(self, v):
-        self.ratio = v
+        # MTPLX: a mismatched snapshot (missing/other-shaped meta) must not
+        # poison the constructed ratio — CacheList.meta_state zips children
+        # to meta entries without a None guard, and codec placeholder trees
+        # decode as None. ratio is a constructor invariant, so bogus meta
+        # values are ignored rather than written.
+        try:
+            ratio = int(v)
+        except (TypeError, ValueError):
+            return
+        self.ratio = ratio
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # MTPLX: _BaseCache.from_state uses __new__ + setters, which skips
+        # __init__ and leaves ratio/undo bookkeeping unset. Build through the
+        # real constructor; a snapshot without a usable ratio cannot rebuild
+        # a PoolingCache and fails loudly instead of corrupting attention.
+        obj = cls(int(meta_state))
+        obj.state = state
+        return obj
 
     def is_trimmable(self):
         # Trim-by-1 contract (MTP draft rejection): possible while the last
@@ -708,12 +727,28 @@ class BatchPoolingCache(_BaseCache):
 
     @meta_state.setter
     def meta_state(self, v):
+        # MTPLX: same None/mismatch guard as PoolingCache.meta_state — keep
+        # the constructed bookkeeping when the snapshot slot is empty.
+        if not v:
+            return
         self.ratio, self.remainder, self._pool_lengths, self._processed = v
         # Restore order between state and meta_state is not fixed; reset in
         # both so _prev_valid always matches the restored batch size.
         self.prev_win_kv = None
         self.prev_win_gate = None
         self._prev_valid = [False] * len(self.remainder)
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # MTPLX: build through __init__ (see PoolingCache.from_state); the
+        # batch shape comes from the recorded per-row lengths.
+        if not meta_state:
+            raise ValueError("BatchPoolingCache.from_state requires meta_state")
+        ratio, _remainder, pool_lengths, _processed = meta_state
+        obj = cls(int(ratio), [0] * len(pool_lengths))
+        obj.state = state
+        obj.meta_state = meta_state
+        return obj
 
     def is_trimmable(self):
         # Trim-by-1 contract (MTP draft rejection): possible while every
