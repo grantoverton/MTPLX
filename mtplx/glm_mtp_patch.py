@@ -512,6 +512,7 @@ def inject_glm_mtp_support(
 ) -> bool:
     """Attach GLM-4 MoE-family native MTP support to a loaded mlx-lm model."""
     import mlx.core as mx
+    from mtplx.vendor.glm5_omlx.glm5_next.linear import linear_forward
 
     if not is_glm_mtp_config(config):
         return False
