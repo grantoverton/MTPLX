@@ -149,11 +149,20 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
             }
         # The shared lm_head feeds the MTP block's shared_head_head in both
         # dialects; its quantized leaves can sit in separate shards.
-        selected.update(
+        lm_head_shards = {
             model_path / rel
             for key, rel in weight_map.items()
             if ".lm_head." in str(key) or str(key).startswith("lm_head.")
-        )
+        }
+        selected.update(lm_head_shards)
+        if not lm_head_shards:
+            # Tied-embedding checkpoints carry no lm_head — the tied fallback
+            # needs the embed_tokens rows for shared_head_head instead.
+            selected.update(
+                model_path / rel
+                for key, rel in weight_map.items()
+                if str(key).endswith("embed_tokens.weight")
+            )
         if selected:
             return sorted(selected)
 
@@ -285,9 +294,6 @@ def _rewrite_glm_mtp_weights(
                 mapped[f"{local_prefix}.shared_head_head.{suffix.removeprefix('shared_head.head.')}"] = value
             elif suffix.startswith(("enorm.", "hnorm.", "eh_proj.")):
                 mapped[f"{local_prefix}.{suffix}"] = value
-            elif suffix.startswith("embed_tokens."):
-                # GLM MTP shares the target embedding; the runtime reuses it.
-                pass
             else:
                 mapped[f"{local_prefix}.mtp_block.{suffix}"] = value
             continue
@@ -448,6 +454,7 @@ def _needs_offset_wrap(entry: Any) -> bool:
 def _make_glm_mtp_module(config: dict[str, Any], args: Any):
     import mlx.core as mx
     import mlx.nn as nn
+    from mtplx.vendor.glm5_omlx.glm5_next.linear import linear_forward
     from mlx_lm.models.base import create_attention_mask
 
     impl = _glm_impl(config)
@@ -484,7 +491,7 @@ def _make_glm_mtp_module(config: dict[str, Any], args: Any):
                 # History-append callers keep only the hidden state; skip the
                 # shared_head vocab projection (154880-wide per token).
                 return None, hidden
-            logits = self.shared_head_head(self.shared_head_norm(hidden))
+            logits = linear_forward(self.shared_head_head, self.shared_head_norm(hidden))
             return logits, hidden
 
     class _GLMMTP(nn.Module):
@@ -568,6 +575,10 @@ def inject_glm_mtp_support(
         ):
             if input_embeddings is not None:
                 raise ValueError("GLM MTP backend does not support input_embeddings")
+            if hidden_variant not in {None, "post_norm", "default", "auto", "contract"}:
+                raise ValueError(
+                    f"GLM MTP backend emits post-norm hidden only; hidden_variant={hidden_variant!r} unsupported"
+                )
             if inputs is None:
                 inputs = kwargs.get("input_ids")
             hidden = trunk_getter(self)(inputs, cache, inputs_embeds=inputs_embeds)
@@ -578,7 +589,7 @@ def inject_glm_mtp_support(
                 return (None, hidden) if return_hidden else None
             keep = int(logits_keep or kwargs.get("num_logits_to_keep") or 0)
             head_in = hidden[:, -max(1, keep) :] if keep else hidden
-            logits = lm_head_getter(self)(head_in)
+            logits = linear_forward(lm_head_getter(self), head_in)
             if not return_hidden:
                 return logits
             return logits, hidden
@@ -598,6 +609,10 @@ def inject_glm_mtp_support(
         ):
             if concat_order not in {None, "embedding_hidden"}:
                 raise ValueError("GLM MTP backend supports embedding_hidden concat order only")
+            if mtp_hidden_variant not in {None, "post_norm", "default", "auto", "contract"}:
+                raise ValueError(
+                    f"GLM MTP backend emits post-norm hidden only; mtp_hidden_variant={mtp_hidden_variant!r} unsupported"
+                )
             depth = 0 if mtp_depth is None else max(int(mtp_depth) - 1, 0)
             depth %= len(self.mtp.layers)
             layer_cache = None
@@ -679,8 +694,11 @@ def inject_glm_mtp_support(
                         for entry in caches
                     ]
                 return caches
-            layers = getattr(getattr(self, "model", None), "layers", ())
-            return [cache_factory() for _ in layers]
+            raise RuntimeError(
+                "GLM MTP backend requires the vendored make_cache; refusing to "
+                "fabricate per-layer caches (KDA layers need ArraysCache, not "
+                "KV+Pooling pairs)"
+            )
 
     target_model.mtp = mtp
     target_model.__class__ = _MTPLXGLMModel
