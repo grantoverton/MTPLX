@@ -265,6 +265,7 @@ def run_mtp_chain_probe(
 
     all_started = time.perf_counter()
     traces: dict[tuple[str, str], dict[str, Any]] = {}
+    trace_errors: dict[str, str] = {}
     prompt_meta = []
     target_token_count = ((windows - 1) * stride) + depth + 3
     for case in prompts:
@@ -282,12 +283,22 @@ def run_mtp_chain_probe(
             }
         )
         for base_hidden in selected_base:
-            traces[(case.id, base_hidden)] = _target_trace(
-                rt,
-                ids,
-                target_token_count=target_token_count,
-                base_hidden_variant=base_hidden,
-            )
+            if base_hidden in trace_errors:
+                continue
+            try:
+                traces[(case.id, base_hidden)] = _target_trace(
+                    rt,
+                    ids,
+                    target_token_count=target_token_count,
+                    base_hidden_variant=base_hidden,
+                )
+            except Exception as exc:
+                # A backend that cannot emit this hidden variant at all
+                # (e.g. glm5_next is post_norm-only) must fail the
+                # candidate, not the whole calibration sweep.
+                trace_errors[base_hidden] = f"{type(exc).__name__}: {exc}"
+                for key in [k for k in traces if k[1] == base_hidden]:
+                    del traces[key]
 
     variants = []
     for base_hidden in selected_base:
@@ -306,9 +317,9 @@ def run_mtp_chain_probe(
                                 prefixes: list[int] = []
                                 rows = []
                                 started = time.perf_counter()
-                                variant_error = None
+                                variant_error = trace_errors.get(base_hidden)
                                 try:
-                                    for case in prompts:
+                                    for case in prompts if variant_error is None else []:
                                         trace = traces[(case.id, base_hidden)]
                                         for window_index in range(windows):
                                             window_start = window_index * stride
