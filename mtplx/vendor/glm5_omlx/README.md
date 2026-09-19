@@ -15,6 +15,10 @@ Layout:
 - `glm_moe_dsa/` — GLM MoE-DSA model + kernel dispatch (`fast.py`,
   `kernels.py`) used by the glm5_next text stack.
 - `deepseek_v4/` — shared helpers (`cache_extras` PoolingCache et al.).
+- `common/csrc/` — the three shared kernel headers the glm_moe_dsa CMake
+  project expects at `../../common/csrc` (`quantized_moe.h`,
+  `steel_attention_block_token.h`, and an MLX `steel/attn/params.h`
+  override), from `omlx/custom_kernels/common/csrc/`.
 - `cache_rollback.py` — oMLX rollback utilities used by MTP verify.
 
 ## Native kernels

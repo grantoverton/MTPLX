@@ -17135,10 +17135,25 @@ def _health_degradation_payload(state: Any) -> dict[str, Any]:
     if flash_dispatches:
         nax["flash_dispatch_counters"] = flash_dispatches
 
+    # GLM-5.3 vendored native dispatch: _ext loaded (fast path) vs mx.fast
+    # fallback (correct but slower). Only meaningful on glm5_next serves.
+    glm5_native: dict[str, Any] = {
+        "extension_loaded": "unknown",
+        "symbols": "unknown",
+    }
+    try:
+        from mtplx.vendor.glm5_omlx.glm_moe_dsa import fast as _glm_fast
+
+        glm5_native["extension_loaded"] = bool(_glm_fast.is_native_available())
+        glm5_native["symbols"] = len(_glm_fast.native_symbols())
+    except BaseException:
+        pass
+
     return {
         "compiled_verify": compiled_verify,
         "profile_env_overridden": profile_env_overridden,
         "nax": nax,
+        "glm5_native": glm5_native,
     }
 
 

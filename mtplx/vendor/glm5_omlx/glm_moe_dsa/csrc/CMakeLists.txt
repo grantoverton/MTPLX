@@ -129,9 +129,10 @@ target_link_libraries(_ext PRIVATE omlx_glm_kernel_ops)
 if(BUILD_SHARED_LIBS)
   # @loader_path resolves the sibling kernel_ops dylib. The second entry
   # resolves the mlx wheel's libmlx.dylib from the installed site-packages
-  # layout (omlx/custom_kernels/<pkg> -> site-packages -> mlx/lib); without
-  # it the only libmlx rpath is the link-time absolute path into the build
-  # env, which is dead after install (issue #2233).
+  # layout; without it the only libmlx rpath is the link-time absolute path
+  # into the build env, which is dead after install (issue #2233).
+  # MTPLX: vendored at mtplx/vendor/glm5_omlx/glm_moe_dsa/, one level deeper
+  # than oMLX's custom_kernels/<pkg>/, so site-packages is four hops up.
   target_link_options(_ext PRIVATE -Wl,-rpath,@loader_path
-                      -Wl,-rpath,@loader_path/../../../mlx/lib)
+                      -Wl,-rpath,@loader_path/../../../../mlx/lib)
 endif()
