@@ -441,14 +441,16 @@ def test_trunk_pair_offset_gates_session_bank_trims():
     assert pool.remainder == 2
 
     # Wrapped pair at a pool window boundary with no undo log: the pool
-    # cannot give the token back, so the restore must decline cleanly —
-    # and the atomic pair trim must leave the KV half untouched (a
-    # refused trim that still shortened KV would desync the pair).
+    # cannot give the token back, so the restore must decline cleanly.
+    # The KV half DOES decrement (base CacheList.trim semantics — that is
+    # the point: KV.offset has no meta_state heal and must always track
+    # trims); the caller unlinked the candidate ref before trimming, so
+    # the declined candidate is orphaned rather than served desynced.
     kv2, pool2 = KVCache(), PoolingCache(4)
     kv2.offset = 6
     wrapped2 = pair_cls(kv2, pool2)
     assert _trim_cache_ref_to_prefix([wrapped2], 6) is False
-    assert kv2.offset == 6
+    assert kv2.offset == 5
 
 
 def test_trunk_pair_wrap_fires_on_vendored_cache_classes():
@@ -517,3 +519,47 @@ def test_kv_b_split_for_bf16_head_lands_embed_q():
     assert unembed_out.shape == (heads, v_head, kv_lora)
     assert "layers.0.mtp_block.self_attn.kv_b_proj.weight" not in mapped
     assert "layers.0.shared_head_head.weight" in mapped
+
+
+def test_gdn_capture_declines_glm_layer_shape():
+    """glm5 exposes fa_idx/ssm_idx but its linear layers carry KDA
+    attention under self_attn — no linear_attn — so the GDN capture
+    lane must decline and fall back to plain AR (previously an
+    AttributeError on the first KDA layer)."""
+    from mtplx.runtime import _gdn_capture_compatible
+
+    glm_layer = SimpleNamespace(self_attn=object())
+    glm_inner = SimpleNamespace(fa_idx=0, ssm_idx=1, layers=[glm_layer, glm_layer])
+    glm_text = SimpleNamespace(model=glm_inner)
+    assert _gdn_capture_compatible(glm_text) is False
+
+    gdn_layer = SimpleNamespace(linear_attn=object())
+    gdn_inner = SimpleNamespace(fa_idx=0, ssm_idx=1, layers=[object(), gdn_layer])
+    gdn_text = SimpleNamespace(model=gdn_inner)
+    assert _gdn_capture_compatible(gdn_text) is True
+
+    # No index surface at all -> plain AR.
+    assert _gdn_capture_compatible(SimpleNamespace(model=SimpleNamespace())) is False
+    # Indices but no resolvable ssm layer -> decline, do not crash.
+    bad = SimpleNamespace(model=SimpleNamespace(fa_idx=[0], ssm_idx=[9], layers=[]))
+    assert _gdn_capture_compatible(bad) is False
+
+
+def test_device_core_gate_declines_glm_pairs():
+    """``qsa_mtp_outer_device_core_supported`` must refuse GLM cache pairs:
+    the pooling half keeps Python-side state an outer mx.compile replay
+    would freeze at trace time."""
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_vlm")
+    from mlx_vlm.models.cache import KVCache as VLMKVCache
+    from mtplx.models.glm5_next import mtp_impl
+    from mtplx.qsa_mtp_precompute import qsa_mtp_outer_device_core_supported
+    from mtplx.vendor.glm5_omlx.deepseek_v4.cache_extras import PoolingCache
+
+    impl = mtp_impl(_glm5_config())
+    pair_cls = impl["cache_pair_cls"]
+    pair = pair_cls(VLMKVCache(), PoolingCache(4))
+    assert qsa_mtp_outer_device_core_supported([pair]) is False
+
+    # Ordinary cache stacks remain eligible.
+    assert qsa_mtp_outer_device_core_supported([VLMKVCache()]) is True

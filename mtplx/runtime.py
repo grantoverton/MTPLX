@@ -82,6 +82,28 @@ def _preflight_laguna_system_memory(config: dict[str, Any]) -> None:
     )
 
 
+def _gdn_capture_compatible(text_model: Any) -> bool:
+    """True when ``forward_with_gdn_capture`` can drive this text stack.
+
+    Index presence alone is not sufficient evidence: GLM-5.3 also exposes
+    ``fa_idx``/``ssm_idx``, but its linear layers carry KDA attention under
+    ``self_attn`` — no ``linear_attn`` module — so routing it into the GDN
+    lane crashes on the first KDA layer (and DSA layers would read the 4-D
+    HyperConnection stream as additive-residual anyway). Require a
+    capture-compatible ssm layer before taking the GDN lane; everything
+    else gets the plain AR forward.
+    """
+
+    inner = getattr(text_model, "model", None)
+    if not (hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx")):
+        return False
+    try:
+        ssm_layer = inner.layers[inner.ssm_idx]
+    except Exception:
+        ssm_layer = None
+    return hasattr(ssm_layer, "linear_attn")
+
+
 @dataclass
 class MTPLXRuntime:
     model: Any
@@ -275,8 +297,7 @@ class MTPLXRuntime:
         capture_backend: str | None = None,
     ):
         text_model = getattr(self.model, "language_model", self.model)
-        inner = getattr(text_model, "model", None)
-        if not (hasattr(inner, "fa_idx") and hasattr(inner, "ssm_idx")):
+        if not _gdn_capture_compatible(text_model):
             # Uniform full-attention model (e.g. hy_v3): every layer is plain
             # causal attention, so there is no GDN/recurrent state to capture
             # and forward_with_gdn_capture's hybrid layout (fa_idx/ssm_idx,

@@ -146,23 +146,41 @@ def mtp_impl(config: Dict[str, Any] | None = None):
         positions were never rolled back, and restored prefix caches kept
         tokens the engine then replayed on top of committed KV. ``offset``
         reports the KV half's token count (PoolingCache's ``offset`` is a
-        compressed-row count, not tokens); ``trim`` is atomic: the pool
-        half can refuse (undo log exhausted at a window boundary), so it
-        trims first and the KV half mirrors only what it accepted — the
-        base ``CacheList.trim`` would trim KV and *then* return the pool's
-        refusal, desyncing the pair. Used for both the MTP draft cache
-        and — via ``glm_mtp_patch.make_cache`` — the vendored trunk pair.
+        compressed-row count, not tokens). ``trim`` deliberately keeps
+        base ``CacheList`` semantics (every child trims ``n``, last result
+        returned) — measured against the alternative: an atomic
+        pool-first trim leaves ``KV.offset`` un-decremented whenever the
+        pool refuses (its undo log stops at a >8-token update), and
+        ``KVCache.meta_state`` is empty so ``rollback_after_verify``'s
+        ``restore_cache`` cannot heal the stranded KV span — every later
+        forward then reads the rejected verify tokens' positions and
+        draft acceptance collapses at depth. Under base ``trim`` the KV
+        half still decrements while the pool half's meta is restored, and
+        restore callers (``_trim_cache_to_offset``,
+        ``_trim_cache_ref_to_*``) already decline on a short count, so a
+        pool refusal rejects the restore candidate instead of serving a
+        desynced pair. Used for both the MTP draft cache and — via
+        ``glm_mtp_patch.make_cache`` — the vendored trunk pair.
         """
 
         @property
         def offset(self):
             return self.caches[0].offset
 
-        def trim(self, n):
-            m = self.caches[1].trim(n)
-            if m:
-                self.caches[0].trim(m)
-            return m
+        def is_trimmable(self):
+            # Pinned AND-semantics: the pair reports trimmable only when both
+            # halves can trim, independent of upstream CacheList convention.
+            return self.caches[0].is_trimmable() and self.caches[1].is_trimmable()
+
+        def reserve_indexer_capacity(self, *args, **kwargs):
+            # Decline marker honored by qsa_mtp_outer_device_core_supported:
+            # like the QSA cache it was named for, the pooling half keeps
+            # Python-side state (_pool_len, remainder, the undo log) that an
+            # mx.compile state replay freezes at trace time — silently
+            # desyncing pool and KV. Opting out keeps --draft-core device /
+            # device-d2 honest: the lane declines instead of corrupting
+            # committed history.
+            return None
 
     tcfg = (config or {}).get("text_config", config or {})
     kpool = int(tcfg.get("index_kpool", 4) or 4)
