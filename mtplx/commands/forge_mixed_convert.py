@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from pathlib import Path
 from typing import Any, Callable
 
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
@@ -82,6 +83,25 @@ def main(argv: list[str] | None = None) -> int:
     if body_bits <= 0:
         raise SystemExit("module_overrides recipes require body_bits > 0")
 
+    try:
+        _src_cfg = json.loads(
+            (Path(args.source) / "config.json").read_text(encoding="utf-8")
+        )
+    except Exception:
+        _src_cfg = {}
+    _src_type = str(
+        (_src_cfg.get("text_config") or {}).get("model_type")
+        or _src_cfg.get("model_type")
+        or ""
+    )
+    if _src_type in {"glm5_next", "glm5_next_text"}:
+        # Same registration the flat glm5 lane performs: upstream mlx_lm has
+        # no glm5_next, and convert() resolves the module by model_type.
+        from mtplx.commands.forge_glm5_convert import (
+            _register_vendored_architectures,
+        )
+
+        _register_vendored_architectures()
     from mlx_lm.convert import convert
 
     convert(

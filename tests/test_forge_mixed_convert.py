@@ -126,3 +126,62 @@ def test_mixed_command_refuses_unquantized_body() -> None:
             recipe={"body_bits": 0, "module_overrides": [{"suffix": "lm_head"}]},
             source_format="bf16_native",
         )
+
+
+def test_glm5_source_registers_vendored_arch(tmp_path, monkeypatch) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "config.json").write_text(
+        json.dumps({"model_type": "glm5_next"}), encoding="utf-8"
+    )
+    import importlib
+    import sys
+
+    convert_mod = importlib.import_module("mlx_lm.convert")
+    calls = {}
+    monkeypatch.setattr(
+        convert_mod,
+        "convert",
+        lambda **kwargs: calls.setdefault("called", True),
+    )
+    from mtplx.commands.forge_mixed_convert import main
+
+    main(
+        [
+            "--source",
+            str(src),
+            "--destination",
+            str(tmp_path / "dst"),
+            "--recipe-json",
+            json.dumps({"body_bits": 4}),
+        ]
+    )
+    assert calls["called"]
+    assert "mlx_lm.models.glm5_next" in sys.modules
+
+
+def test_non_glm5_source_skips_vendored_registration(tmp_path, monkeypatch) -> None:
+    import importlib
+    import sys
+
+    convert_mod = importlib.import_module("mlx_lm.convert")
+    sys.modules.pop("mlx_lm.models.glm5_next", None)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_next"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(convert_mod, "convert", lambda **kwargs: None)
+    from mtplx.commands.forge_mixed_convert import main
+
+    main(
+        [
+            "--source",
+            str(src),
+            "--destination",
+            str(tmp_path / "dst"),
+            "--recipe-json",
+            json.dumps({"body_bits": 4}),
+        ]
+    )
+    assert "mlx_lm.models.glm5_next" not in sys.modules
