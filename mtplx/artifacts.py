@@ -12,6 +12,7 @@ from typing import Any
 
 from .constants import (
     EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
+    EXPECTED_GLM5_MTP_KEYS,
     EXPECTED_MTP_KEYS,
     EXPECTED_MTP_TENSOR_COUNT,
     EXPECTED_PREQUANTIZED_MTP_KEYS,
@@ -72,7 +73,7 @@ from .profiles import (
     QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
 )
 
-MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
+MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.", "model.mtp.")
 _KNOWN_PUBLIC_MODEL_ALIASES = {
     # Served public ids (the exact strings /v1/models advertises) resolve to
     # their first-party repos. Explicit ids only — consistent with the July
@@ -295,6 +296,14 @@ def _mtp_expected_key_set(
     def _expanded(base: tuple[str, ...]) -> set[str]:
         return expand_mtp_layer_keys(base, n_layers)
 
+    if _is_glm5_mtp_layout(config, normalized):
+        expected = _expanded(EXPECTED_GLM5_MTP_KEYS)
+        return (
+            expected,
+            len(expected),
+            "glm5-next",
+        )
+
     if _is_qwen_moe_mtp_layout(config, normalized):
         if any(".mlp.switch_mlp." in key for key in normalized):
             has_prequantized_aux = any(
@@ -376,6 +385,22 @@ def _observed_sidecar_format(sidecar_format: str, tensors: tuple[TensorInfo, ...
     if dtypes == {"F16"}:
         return "fp16"
     return sidecar_format
+
+
+def _is_glm5_mtp_layout(config: dict[str, Any], normalized_keys: set[str]) -> bool:
+    tcfg = text_config(config)
+    markers = (
+        str(config.get("model_type") or ""),
+        str(tcfg.get("model_type") or ""),
+        " ".join(str(item) for item in (config.get("architectures") or [])),
+        " ".join(str(item) for item in (tcfg.get("architectures") or [])),
+    )
+    if any("glm5" in marker.lower() for marker in markers):
+        return True
+    return any(
+        ".block.mlp.switch_mlp." in key or key.endswith(".enorm.weight")
+        for key in normalized_keys
+    )
 
 
 def _is_qwen_moe_mtp_layout(config: dict[str, Any], normalized_keys: set[str]) -> bool:
