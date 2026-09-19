@@ -575,6 +575,12 @@ def inject_glm_mtp_support(
             mtp_hidden_variant: str | None = None,
             input_embeddings=None,
         ):
+            if input_embeddings is not None:
+                # Accepting then dropping the spliced vision rows would
+                # silently corrupt the draft history (runtime #103).
+                raise ValueError(
+                    "GLM MTP history append does not support input_embeddings"
+                )
             _logits, hidden = self.mtp_forward(
                 hidden_states,
                 next_token_ids,
