@@ -423,7 +423,7 @@ def _make_glm_mtp_module(config: dict[str, Any], args: Any):
             self.shared_head_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
             self.shared_head_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-        def __call__(self, input_ids, previous_hidden_states, *, embed_tokens, cache=None):
+        def __call__(self, input_ids, previous_hidden_states, *, embed_tokens, cache=None, emit_logits=True):
             inputs_embeds = embed_tokens(input_ids)
             mixed = self.eh_proj(
                 mx.concatenate(
@@ -437,6 +437,10 @@ def _make_glm_mtp_module(config: dict[str, Any], args: Any):
                 mask_cache = selector(cache)
             mask = create_attention_mask(mixed, mask_cache, return_array=return_array_mask)
             hidden = self.mtp_block(mixed, mask=mask, cache=cache)
+            if not emit_logits:
+                # History-append callers keep only the hidden state; skip the
+                # shared_head vocab projection (154880-wide per token).
+                return None, hidden
             logits = self.shared_head_head(self.shared_head_norm(hidden))
             return logits, hidden
 
@@ -535,6 +539,7 @@ def inject_glm_mtp_support(
             mtp_hidden_variant: str = "post_norm",
             position_offset: int | None = None,
             mtp_depth: int | None = None,
+            emit_logits: bool = True,
         ):
             if concat_order not in {None, "embedding_hidden"}:
                 raise ValueError("GLM MTP backend supports embedding_hidden concat order only")
@@ -553,6 +558,7 @@ def inject_glm_mtp_support(
                     hidden_states,
                     embed_tokens=embed_getter(self),
                     cache=layer_cache,
+                    emit_logits=emit_logits,
                 )
             if not return_hidden:
                 return logits
@@ -576,6 +582,9 @@ def inject_glm_mtp_support(
                 concat_order=concat_order,
                 return_hidden=True,
                 mtp_depth=mtp_depth,
+                # History appends only consume the hidden state; skip the
+                # 154880-wide shared_head projection per replayed token.
+                emit_logits=False,
             )
             return hidden
 
