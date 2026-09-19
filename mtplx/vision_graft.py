@@ -213,6 +213,43 @@ def _write_vision_sidecar(
             tmp.unlink()
 
 
+def _restore_vision_metadata(source: Path, destination: Path) -> bool:
+    """Repair vision metadata on a destination that already carries vision
+    weights but whose convert lane serialized a text-only config (issue
+    #263; e.g. glm5_next vendored trunks emit ``vision_model.*`` weights
+    with no ``vision_config``). Restores ``vision_config``, missing token
+    ids, and preprocessor sidecars. Returns True when anything changed."""
+    if not source.is_dir():
+        return False
+    source_config = _load_json(source / "config.json")
+    if not isinstance(source_config, dict) or not isinstance(
+        source_config.get("vision_config"), dict
+    ):
+        return False
+    config_path = destination / "config.json"
+    config = _load_json(config_path)
+    changed = False
+    if not isinstance(config.get("vision_config"), dict):
+        config["vision_config"] = _normalize_vision_config(
+            source_config["vision_config"]
+        )
+        changed = True
+    for key in _VISION_TOKEN_ID_KEYS:
+        if key not in config and key in source_config:
+            config[key] = source_config[key]
+            changed = True
+    if changed:
+        _atomic_write_json(config_path, config)
+    missing_sidecars = any(
+        not (destination / name).exists() and (source / name).is_file()
+        for name in _VISION_SIDECAR_FILES
+    ) or not (destination / "processor_config.json").exists()
+    if missing_sidecars:
+        _copy_vision_sidecars(source, destination)
+        changed = True
+    return changed
+
+
 def _copy_vision_sidecars(source: Path, destination: Path) -> list[str]:
     copied: list[str] = []
     for name in _VISION_SIDECAR_FILES:
@@ -272,7 +309,10 @@ def graft_vision_tower(
         report["status"] = "no-destination-index"
         return report
     if resolve_vision_prefix(dest_weight_map) is not None:
-        report["status"] = "already-present"
+        restored = _restore_vision_metadata(source, destination)
+        report["status"] = "metadata-restored" if restored else "already-present"
+        if restored:
+            report["metadata_restored"] = True
         return report
 
     source_index_path = source / "model.safetensors.index.json"

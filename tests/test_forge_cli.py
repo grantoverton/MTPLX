@@ -2560,6 +2560,46 @@ def test_forge_preserves_vision_tower(tmp_path):
     assert report["status"] == "already-present"
 
 
+def test_forge_restores_vision_metadata(tmp_path):
+    """Convert lanes that keep vision weights but serialize a text-only
+    config (issue #263; e.g. glm5_next vendored trunks emit vision_model.*
+    weights with no vision_config) get the metadata repaired in place."""
+    from mtplx.vision_graft import graft_vision_tower
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    source_tensors = _write_multimodal_source(source)
+
+    vision_tensors = {
+        key.replace("model.visual.", "vision_model."): value
+        for key, value in source_tensors.items()
+        if key.startswith("model.visual.")
+    }
+    _write_json(destination / "config.json", {"model_type": "glm5_next"})
+    _write_json(
+        destination / "model.safetensors.index.json",
+        {"weight_map": {key: "model.safetensors" for key in vision_tensors}},
+    )
+    mx.save_safetensors(str(destination / "model.safetensors"), vision_tensors)
+
+    report = graft_vision_tower(source, destination)
+    assert report["status"] == "metadata-restored"
+
+    config = json.loads(
+        (destination / "config.json").read_text(encoding="utf-8")
+    )
+    assert isinstance(config.get("vision_config"), dict)
+    assert config["image_token_id"] == 248056
+    assert (destination / "preprocessor_config.json").exists()
+
+    forge._validate_vision_payload(source, destination)
+
+    # Idempotent: a second pass must be a no-op.
+    report = graft_vision_tower(source, destination)
+    assert report["status"] == "already-present"
+
+
 def test_forge_vision_noop_for_text_only_source(tmp_path):
     source = tmp_path / "source"
     destination = tmp_path / "destination"

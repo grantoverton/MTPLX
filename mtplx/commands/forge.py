@@ -1991,11 +1991,14 @@ def _ensure_vision_tower(source: Path, destination: Path) -> None:
         report = graft_vision_tower(source, destination, verify_load=True)
     except VisionGraftError as exc:
         raise ForgeError(f"vision tower graft failed: {exc}") from exc
-    if report.get("status") == "grafted":
+    status = report.get("status")
+    if status == "grafted":
         _err(
             f"[forge] restored vision tower: {report.get('tensors')} tensors "
             f"({report.get('bytes')} bytes) in {report.get('vision_file')}"
         )
+    elif status == "metadata-restored":
+        _err("[forge] restored vision metadata: weights present, config repaired")
 
 
 def _validate_vision_payload(source: Path, destination: Path) -> None:
