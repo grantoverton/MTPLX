@@ -9261,6 +9261,22 @@ def generate_mtpk(
         """Single choke point for round completion: preserves append_event
         semantics and emits the per-round route census when the tape is on."""
         append_event(event)
+        _emit_dump = os.environ.get("MTPLX_EMIT_DUMP")
+        if _emit_dump:
+            try:
+                with open(_emit_dump, "a", encoding="utf-8") as _f:
+                    _f.write(json.dumps({
+                        "step": event.get("step"),
+                        "primary": event.get("primary"),
+                        "drafts": [d.get("token") for d in event.get("drafts", [])],
+                        "accepted": event.get("accepted_depths"),
+                        "rejected_at": event.get("rejected_at_depth"),
+                        "correction": event.get("correction"),
+                        "bonus": event.get("bonus_token"),
+                        "tokens": list(tokens),
+                    }) + "\n")
+            except Exception:
+                pass
         if not route_tape.enabled:
             return
         nonlocal _rt_prev
@@ -9991,6 +10007,39 @@ def generate_mtpk(
         and mtp_cache_policy == "persistent"
         and _mtp_history_uses_committed_cache(mtp_history_policy)
         and _env_enabled_default_on("MTPLX_GREEDY_DRAFT_CHAIN")
+    )
+    # Sampled counterpart of the greedy chain above: one device eval per
+    # round for the whole draft depth.  Each level still draws from its own
+    # shaped distribution (``_device_draft_q_arrays`` is the on-device mirror
+    # of the host sampler) and reports that q for the accept/residual math,
+    # so the speculative law is unchanged; what disappears is the per-step
+    # dense-vocab host softmax + .item() sync the product lane pays at
+    # draft_top_k=0.  top_k<=0 caps the proposal support at 1024 — the
+    # reported q is the distribution actually drawn from (self-consistent
+    # accept), and any realistic top_p nucleus lives far inside it.
+    _sampled_chain_eligible = (
+        _trio_context_ok
+        and draft_sampler.temperature > 0
+        and sampler.temperature > 0
+        and a3b_target_prefix_route is None
+        and constraint is None
+        and draft_margin_threshold is None
+        and _draft_conf_width_threshold is None
+        and adaptive_policy is None
+        and adaptive_width_policy is None
+        and mtp_corrector is None
+        and mtp_topk_reranker is None
+        and not adapter_ensemble_q
+        and not online_hidden_enabled
+        and not online_correction_cache
+        and not prompt_correction_cache
+        and not target_prefix_verify
+        and not _penalties_active
+        and _frspec_legacy_ids is None
+        and mtp_cache_policy == "persistent"
+        and _mtp_history_uses_committed_cache(mtp_history_policy)
+        and not os.environ.get("MTPLX_ADAPTIVE_DTEMP")
+        and _env_enabled_default_on("MTPLX_SAMPLED_DRAFT_CHAIN")
     )
     # Acceptance-EMA adaptive draft temperature (MTPLX_ADAPTIVE_DTEMP,
     # default off) — HYPER-PLAN §15 ship shape for the register-dependent
@@ -11425,8 +11474,114 @@ def generate_mtpk(
             draft_hidden = _chain_hidden
             next_token = _chain_tokens[-1]
             _greedy_chain_used = True
+        _sampled_chain_used = False
+        if (
+            _sampled_chain_eligible
+            and not used_device_core
+            and not _greedy_chain_used
+            and cycle_depth > 0
+            and _cc_draft_source_token is None
+            and not _steer_active
+            and mtp_cache is not None
+            and _draft_k20_prescatter_plan is None
+        ):
+            _chain_started = time.perf_counter()
+            _chain_tok = mx.array([[int(next_token)]])
+            _chain_hidden = draft_hidden
+            _chain_pending: list[tuple[mx.array, mx.array, mx.array]] = []
+            _chain_offsets: list[int | None] = []
+            _chain_keys = mx.random.split(
+                mx.random.key(int(rng.integers(0, np.iinfo(np.int32).max))),
+                cycle_depth,
+            )
+            _chain_top_k = int(draft_sampler.top_k or 0)
+            if _chain_top_k <= 0:
+                _chain_top_k = 1024
+            _chain_vocab = 0
+            for _chain_depth in range(cycle_depth):
+                _chain_offsets.append(mtp_position_offset_for_cache(mtp_cache))
+                _chain_logits, _chain_hidden_level = rt.draft_mtp(
+                    _chain_hidden,
+                    _chain_tok,
+                    mtp_cache=mtp_cache,
+                    return_hidden=True,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_depth=_chain_depth + 1,
+                    position_offset=_chain_offsets[-1],
+                )
+                _chain_vocab = int(_chain_logits.shape[-1])
+                _chain_row = _chain_logits[:, -1, :][0]
+                _top_idx, _q_norm = _device_draft_q_arrays(
+                    _chain_row,
+                    temperature=float(draft_sampler.temperature),
+                    top_k=min(_chain_top_k, _chain_vocab),
+                    top_p=float(draft_sampler.top_p),
+                )
+                _cdf = mx.cumsum(_q_norm, axis=-1)
+                _u = mx.random.uniform(key=_chain_keys[_chain_depth])
+                _pick = mx.minimum(
+                    (_cdf <= _u).sum(), _top_idx.shape[0] - 1
+                ).astype(mx.int32)
+                _chain_tok = _top_idx[_pick].reshape(1, 1)
+                _chain_pending.append((_top_idx, _q_norm, _chain_tok))
+                _chain_hidden = _chain_hidden_level[:, -1:, :]
+                draft_hidden_for_update.append(_chain_hidden)
+            _eval(
+                _chain_hidden,
+                *[arr for _pend in _chain_pending for arr in _pend],
+            )
+            _chain_elapsed = time.perf_counter() - _chain_started
+            draft_time += _chain_elapsed
+            _add_timing(event, "draft", _chain_elapsed)
+            _chain_tokens: list[int] = []
+            for _chain_index, (_top_idx, _q_norm, _chain_tok) in enumerate(
+                _chain_pending
+            ):
+                _chain_token = int(_chain_tok.reshape(-1)[0])
+                _chain_tokens.append(_chain_token)
+                draft_tokens.append(_chain_token)
+                draft_probs.append(
+                    SparseDistribution(
+                        token_ids=np.asarray(_top_idx),
+                        probs=np.asarray(_q_norm, dtype=np.float64),
+                        vocab_size=_chain_vocab,
+                    )
+                )
+                drafted += 1
+                drafted_by_depth[_chain_index] += 1
+                _chain_source = (
+                    int(next_token)
+                    if _chain_index == 0
+                    else _chain_tokens[_chain_index - 1]
+                )
+                draft_hidden_update_keys.append(
+                    (_chain_index + 1, _chain_source)
+                    if online_hidden_corrector_key == "token"
+                    else _chain_index + 1
+                )
+                _chain_event = {
+                    "depth": _chain_index + 1,
+                    "token": _chain_token,
+                    "timing_s": {
+                        "draft": _chain_elapsed
+                        if _chain_index == len(_chain_pending) - 1
+                        else 0.0
+                    },
+                    "mtp_corrector": None,
+                    "draft_core": "sampled-chain",
+                }
+                if _chain_offsets[_chain_index] is not None:
+                    _chain_event["position_offset"] = int(
+                        _chain_offsets[_chain_index]
+                    )
+                event["drafts"].append(_chain_event)
+            draft_hidden = _chain_hidden
+            next_token = _chain_tokens[-1]
+            _sampled_chain_used = True
         for depth_index in range(
-            0 if (used_device_core or _greedy_chain_used) else cycle_depth
+            0
+            if (used_device_core or _greedy_chain_used or _sampled_chain_used)
+            else cycle_depth
         ):
             source_token = int(next_token)
             step_mtp_cache = (

@@ -14,6 +14,22 @@ from mlx_vlm.models.base import (
 )
 from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
 from mlx_vlm.models.deepseek_v4.hyper_connection import HyperConnection, hc_expand
+
+
+_COMPILE_MAX_S: Optional[int] = None
+
+
+def _glm5_compile_max_s() -> int:
+    global _COMPILE_MAX_S
+    if _COMPILE_MAX_S is None:
+        import os as _os
+
+        try:
+            _COMPILE_MAX_S = max(1, int(_os.environ.get("MTPLX_GLM5_COMPILE_MAX_S", "1")))
+        except ValueError:
+            _COMPILE_MAX_S = 1
+    return _COMPILE_MAX_S
+
 from mlx_lm.models.mla import MultiLinear
 from mtplx.vendor.glm5_omlx.deepseek_v4.switch_layers import SwitchGLU
 from mtplx.vendor.glm5_omlx.glm_moe_dsa.deepseek_v32 import (
@@ -26,7 +42,44 @@ from mtplx.vendor.glm5_omlx.glm_moe_dsa.sparse_mla import (
     sparse_mla_attention,
 )
 from .config import ModelConfig, TextConfig
+import os as _os_prof
+import time as _prof_time
+
 from .gated_delta import gated_delta_update
+
+# GLM_PROFILE_LAYERS=<path>: per-layer eager sync timing (diagnostic only --
+# forces an mx.eval per layer so totals inflate, but reveals distribution).
+_PROF_LAYERS = None
+_PROF_LAYERS_PATH = _os_prof.environ.get("GLM_PROFILE_LAYERS")
+if _PROF_LAYERS_PATH:
+    _PROF_LAYERS = ({}, {}, {})
+    import atexit as _prof_atexit
+    import json as _prof_json
+
+    def _prof_dump():
+        _counts, _sums, _kinds = _PROF_LAYERS
+        _rows = [
+            {"layer": k, "kind": v, "calls": _counts.get(k, 0),
+             "total_s": _sums.get(k, 0.0), "ms_per_call": _sums.get(k, 0.0) / max(1, _counts.get(k, 1)) * 1000}
+            for k, v in _kinds.items()
+            if isinstance(k, int)
+        ]
+        _rows.sort(key=lambda r: -r["total_s"])
+        try:
+            with open(_PROF_LAYERS_PATH, "w") as _f:
+                _prof_json.dump(_rows, _f, indent=1)
+        except OSError:
+            pass
+
+    _prof_atexit.register(_prof_dump)
+    import threading as _prof_threading
+
+    def _prof_periodic():
+        while True:
+            _prof_time.sleep(15)
+            _prof_dump()
+
+    _prof_threading.Thread(target=_prof_periodic, daemon=True).start()
 from .linear import fused_quantized_matmul, linear_forward
 
 
@@ -378,6 +431,20 @@ class Glm5NextIndexer(nn.Module):
         try:
             from mtplx.vendor.glm5_omlx.glm_moe_dsa.kernels import fast
 
+            if q.shape[1] == 1 and fast.has_symbol("dsa_decode_scores"):
+                try:
+                    qt = mx.contiguous(q.transpose(0, 2, 1, 3))
+                    scores = fast.dsa_decode_scores(
+                        qt,
+                        pool_keys[:, None],
+                        mx.contiguous(weights[:, 0]),
+                        True,
+                    )
+                    if scores.ndim == 4:
+                        return scores[:, 0]
+                    return scores
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
             qt = q.transpose(0, 2, 1, 3)
@@ -871,7 +938,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # was validated on and where its win lives. Compiling the 288-expert MoE at a
         # batched or prefill shape spikes memory (it can OOM alongside the resident
         # weights), so those shapes take the eager path.
-        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
+        _compile_max_s = _glm5_compile_max_s()
+        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] <= _compile_max_s:
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
@@ -921,9 +989,27 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
-        for layer, c in zip(self.layers, cache):
-            mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask=mask, cache=c)
+        _prof = _PROF_LAYERS
+        if _prof is not None:
+            _counts, _sums, _kinds = _prof
+            for _li, (layer, c) in enumerate(zip(self.layers, cache)):
+                mask = ssm_mask if layer.is_linear else fa_mask
+                _t0 = _prof_time.perf_counter()
+                h = layer(h, mask=mask, cache=c)
+                mx.eval(h)
+                _dt = _prof_time.perf_counter() - _t0
+                _sums[_li] = _sums.get(_li, 0.0) + _dt
+                _counts[_li] = _counts.get(_li, 0) + 1
+                _kinds[_li] = "kda" if layer.is_linear else "dsa"
+            try:
+                _counts["_S"] = _counts.get("_S", 0) + 1
+                _kinds["_S" + str(_counts["_S"] % 1000)] = h.shape[1]
+            except Exception:
+                pass
+        else:
+            for layer, c in zip(self.layers, cache):
+                mask = ssm_mask if layer.is_linear else fa_mask
+                h = layer(h, mask=mask, cache=c)
 
         h = h.mean(axis=2)
         return self.norm(h)

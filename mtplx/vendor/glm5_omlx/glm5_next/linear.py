@@ -47,9 +47,41 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
         return None
 
 
+def _verify_width_qmm(linear: nn.QuantizedLinear, x: mx.array):
+    """DFlash small-M verify kernels: M in {4,16} affine quantized matmul."""
+    m = 1
+    for d in x.shape[:-1]:
+        m *= int(d)
+    if m not in (4, 16):
+        return None
+    if getattr(linear, "mode", "affine") != "affine":
+        return None
+    try:
+        from mtplx.vendor.glm5_omlx import verify_qmm
+
+        out = verify_qmm.verify_matmul(
+            x,
+            linear.weight,
+            linear.scales,
+            linear.biases,
+            transpose=True,
+            group_size=int(linear.group_size),
+            bits=int(linear.bits),
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    bias = linear.get("bias")
+    if bias is not None:
+        out = out + bias
+    return out
+
+
 def linear_forward(linear: nn.Module, x: mx.array) -> mx.array:
     """Use oMLX's affine prefill tile when it is supported and profitable."""
     if isinstance(linear, nn.QuantizedLinear):
+        verify_out = _verify_width_qmm(linear, x)
+        if verify_out is not None:
+            return verify_out
         if (
             "bias" in linear
             and getattr(linear, "mode", None) == "affine"

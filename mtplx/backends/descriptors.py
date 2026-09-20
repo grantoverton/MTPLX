@@ -10,6 +10,7 @@ without inheriting Qwen-specific assumptions.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -900,7 +901,7 @@ GLM5_NEXT_DESCRIPTOR = BackendDescriptor(
         display_label="Draft depth",
         default=3,
         minimum=1,
-        maximum=3,
+        maximum=max(3, int(os.environ.get("MTPLX_GLM5_MAX_DEPTH", "3") or 3)),
         unit="depth",
     ),
     uses_external_assistant=False,

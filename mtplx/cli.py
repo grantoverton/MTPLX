@@ -3621,6 +3621,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable API-key auth for localhost binds (non-localhost still requires a key)",
     )
     serve_p.add_argument("--depth", type=int, default=3)
+    serve_p.add_argument("--online-hidden-corrector-alpha", type=float, default=0.0)
+    serve_p.add_argument("--online-hidden-corrector-decay", type=float, default=0.8)
+    serve_p.add_argument("--online-hidden-corrector-warmup", type=int, default=1)
+    serve_p.add_argument("--online-hidden-corrector-key", default="global")
     _add_mtp_toggle_args(serve_p)
     serve_p.add_argument(
         "--generation-mode",
