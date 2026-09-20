@@ -686,12 +686,18 @@ class Glm5NextSparseAttention(nn.Module):
             valid_sel = topk_indices >= 0
             if L == 1:
                 clamped = mx.clip(topk_indices[:, :, 0, :], 0, Kv - 1)
-                idx = clamped[..., None]
+                B_, H_, TK_ = clamped.shape
+                # Front-axis gather on the un-broadcast source: broadcasting
+                # kv_latent to (B,H,Kv,dim) makes take_along_axis lower to a
+                # per-element gather over the expanded view.
                 kv_latent = mx.take_along_axis(
-                    kv_latent,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
-                    axis=2,
-                )
+                    kv_latent[:, 0],
+                    mx.broadcast_to(
+                        clamped.reshape(B_, H_ * TK_, 1),
+                        (B_, H_ * TK_, kv_latent.shape[-1]),
+                    ),
+                    axis=1,
+                ).reshape(B_, H_, TK_, kv_latent.shape[-1])
                 sel_mask = valid_sel[:, :, 0, :][:, :, None, :]
                 if mask is not None and mask.dtype == mx.bool_:
                     # Single-stream decode passes mask=None here; under continuous
@@ -795,10 +801,12 @@ class Glm5NextSparseAttention(nn.Module):
         topk = selected.shape[-1]
         clamped = mx.clip(selected, 0, Kv - 1)
         gathered = mx.take_along_axis(
-            mx.broadcast_to(kv_latent[:, 0, None], (B, L, Kv, dim)),
-            mx.broadcast_to(clamped[..., None], (B, L, topk, dim)),
-            axis=2,
-        )
+            kv_latent[:, 0],
+            mx.broadcast_to(
+                clamped.reshape(B, L * topk, 1), (B, L * topk, dim)
+            ),
+            axis=1,
+        ).reshape(B, L, topk, dim)
         q_latent = self.embed_q(q).transpose(0, 2, 1, 3).reshape(B * L, H, 1, dim)
         gathered = gathered.reshape(B * L, 1, topk, dim)
         valid = (selected >= 0).reshape(B * L, 1, 1, topk)
