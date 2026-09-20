@@ -116,12 +116,14 @@ class PoolingCache(_BaseCache):
 
         # One-update undo log for MTP draft rejection: trim() needs the
         # pre-update state plus this update's raw inputs to undo the last
-        # token when it completed a pool window. Only decode / MTP-verify
-        # sized updates (L <= 8 covers depth-k chain verify windows) are
-        # ever trimmed; skipping the stash for prompt chunks avoids pinning
-        # large prefill projections. Buffer slices are taken before any
-        # mutation, so they reference the pre-update array node.
-        if L <= 8:
+        # token when it completed a pool window. Only decode / verify sized
+        # updates are ever trimmed: L <= 64 covers depth-k chain verify
+        # windows (<= depth+1 tokens) AND context-copy block verifies
+        # (primary + up to 32 copied tokens = 33); skipping the stash for
+        # prompt chunks avoids pinning large prefill projections. Buffer
+        # slices are taken before any mutation, so they reference the
+        # pre-update array node.
+        if L <= 64:
             try:
                 from mtplx.vendor.glm5_omlx import cache_rollback
 
@@ -328,6 +330,13 @@ class PoolingCache(_BaseCache):
         k = undo[4].shape[1] - n
         return k >= 0
 
+    def can_trim(self, n):
+        # n-token form of the trimmability contract: is_trimmable() only
+        # certifies a 1-token trim, but verify rollback and per-position
+        # commit need to know whether THIS window can be rolled back before
+        # any state is mutated.
+        return n <= self.remainder or self._can_undo(n)
+
     def trim(self, n):
         if n <= self.remainder:
             self.remainder -= n
@@ -523,7 +532,7 @@ class BatchPoolingCache(_BaseCache):
         # tensor needs no snapshot: update_and_fetch only writes beyond the
         # old _pool_lengths.  trim() drops that speculative physical tail
         # after restoring the logical lengths.
-        if L <= 8:
+        if L <= 64:
             try:
                 from mtplx.vendor.glm5_omlx import cache_rollback
 
@@ -532,7 +541,12 @@ class BatchPoolingCache(_BaseCache):
                 )
             except Exception:
                 decode_consistent = False
-            if decode_consistent and getattr(self, "_undo_chain", False):
+            if (
+                decode_consistent
+                and getattr(self, "_undo_chain", False)
+                and self._undo is not None
+                and self._undo[5].shape[1] + L <= 64
+            ):
                 undo = self._undo
                 self._undo = (
                     *undo[:5],
@@ -834,6 +848,10 @@ class BatchPoolingCache(_BaseCache):
             self._undo = None
             self._undo_chain = False
         return n
+
+    def can_trim(self, n):
+        # n-token form of the trimmability contract (see PoolingCache).
+        return n <= min(self.remainder) or self._can_undo(n)
 
     def _can_trim_rows(self, trims):
         if not trims or len(trims) != len(self.remainder) or min(trims) < 0:

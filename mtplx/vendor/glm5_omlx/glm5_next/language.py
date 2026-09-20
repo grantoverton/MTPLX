@@ -1,3 +1,5 @@
+import contextlib
+import contextvars
 import logging
 from typing import Any, Optional
 
@@ -26,6 +28,25 @@ from mtplx.vendor.glm5_omlx.glm_moe_dsa.sparse_mla import (
 from .config import ModelConfig, TextConfig
 from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
+
+
+# Speculative-verify row capture (family capture-commit): during a
+# verify forward under verify_capture_scope(), each KDA layer retains the
+# exact recurrence inputs it consumed so a rejected window can commit by
+# replaying only the gated-delta recurrences over the accepted prefix.
+_VERIFY_CAPTURE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "glm5_next_verify_capture", default=False
+)
+
+
+@contextlib.contextmanager
+def verify_capture_scope():
+    token = _VERIFY_CAPTURE.set(True)
+    try:
+        yield
+    finally:
+        _VERIFY_CAPTURE.reset(token)
+
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
@@ -265,6 +286,13 @@ class Glm5NextLinearAttention(nn.Module):
         in_dtype = q.dtype
         q = (_l2norm(q.astype(mx.float32)) * (self.head_dim**-0.5)).astype(in_dtype)
         k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
+
+        if cache is not None and _VERIFY_CAPTURE.get():
+            # Retain the rows the recurrence consumed (plus the pre-conv
+            # stream for the conv-state tail) so a rejected verify window
+            # commits by replaying only this recurrence from the pre-verify
+            # snapshot -- no trunk re-forward.
+            cache._mtplx_verify_rows = (mixed, q, k, v, a, b_o)
 
         state = cache[1] if cache is not None else None
         out, state = gated_delta_update(
@@ -899,6 +927,108 @@ class Glm5NextModel(nn.Module):
 
         h = h.mean(axis=2)
         return self.norm(h)
+
+
+
+    def verify_capture_scope(self):
+        return verify_capture_scope()
+
+    def commit_verified_window(
+        self,
+        cache,
+        snapshot_states,
+        *,
+        keep_tokens: int,
+        verified_tokens: int,
+    ) -> bool:
+        """Repair-free commit of a speculative verify window.
+
+        Sparse/indexer entries trim their uncommitted tail through the
+        pair's undo machinery; each KDA (linear-attention) layer replays
+        ONLY its gated-delta recurrence over the kept rows from the
+        pre-verify snapshot state. Validates every entry before mutating
+        any so a refusal leaves the cache intact for the rollback +
+        re-forward fallback. Returns True when the commit landed.
+        """
+        keep_tokens = int(keep_tokens)
+        verified_tokens = int(verified_tokens)
+        trim_n = verified_tokens - keep_tokens
+        if keep_tokens < 1 or trim_n < 0 or len(cache) != len(self.layers):
+            return False
+        if trim_n == 0:
+            # Full accept: the verify forward already left every entry in
+            # the post-window state. Drop the stashed rows and return.
+            for entry in cache:
+                if entry is not None and getattr(
+                    entry, "_mtplx_verify_rows", None
+                ) is not None:
+                    entry._mtplx_verify_rows = None
+            return True
+
+        plan = []
+        for i, (layer, entry) in enumerate(zip(self.layers, cache)):
+            if entry is None:
+                return False
+            if layer.is_linear:
+                rows = getattr(entry, "_mtplx_verify_rows", None)
+                if (
+                    rows is None
+                    or len(rows) != 6
+                    or rows[0].shape[1] != verified_tokens
+                ):
+                    return False
+                pre = snapshot_states[i] if snapshot_states is not None else None
+                if pre is None or len(pre) < 2 or pre[1] is None:
+                    return False
+                plan.append(("kda", i, rows))
+            else:
+                can_trim = getattr(entry, "can_trim", None)
+                if callable(can_trim):
+                    if not can_trim(trim_n):
+                        return False
+                elif not entry.is_trimmable():
+                    return False
+                plan.append(("trim", i, None))
+
+        for kind, i, payload in plan:
+            entry = cache[i]
+            if kind == "trim":
+                entry.trim(trim_n)
+                continue
+            mixed, q, k, v, a, b_o = payload
+            attn = self.layers[i].self_attn
+            pre = snapshot_states[i]
+            conv_pre = pre[0]
+            if conv_pre is None:
+                conv_pre = mx.zeros(
+                    (
+                        mixed.shape[0],
+                        attn.conv_kernel_size - 1,
+                        mixed.shape[2],
+                    ),
+                    dtype=mixed.dtype,
+                )
+            fg = attn.forget_gate
+            _, new_state = gated_delta_update(
+                q[:, :keep_tokens],
+                k[:, :keep_tokens],
+                v[:, :keep_tokens],
+                a[:, :keep_tokens],
+                b_o[:, :keep_tokens],
+                fg.A_log.reshape(attn.num_heads, 1),
+                fg.dt_bias.reshape(attn.num_heads, attn.head_dim),
+                state=pre[1],
+                lower_bound=fg.safe_gate_lower_bound,
+            )
+            conv_input = mx.concatenate(
+                [conv_pre, mixed[:, :keep_tokens]], axis=1
+            )
+            entry[0] = mx.contiguous(
+                conv_input[:, -(attn.conv_kernel_size - 1) :, :]
+            )
+            entry[1] = new_state
+            entry._mtplx_verify_rows = None
+        return True
 
 
 class LanguageModel(nn.Module):

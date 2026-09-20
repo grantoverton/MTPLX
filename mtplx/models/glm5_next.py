@@ -63,6 +63,19 @@ def model_classes() -> tuple[type, type]:
     from mtplx.vendor.glm5_omlx.glm5_next.glm5_next import Model as _VLMModel
 
     class Model(_VLMModel):
+        def verify_capture_scope(self):
+            return self.language_model.model.verify_capture_scope()
+
+        def commit_verified_window(
+            self, cache, snapshot_states, *, keep_tokens, verified_tokens
+        ):
+            return self.language_model.model.commit_verified_window(
+                cache,
+                snapshot_states,
+                keep_tokens=keep_tokens,
+                verified_tokens=verified_tokens,
+            )
+
         def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
             remapped = {
                 key: value
@@ -171,6 +184,19 @@ def mtp_impl(config: Dict[str, Any] | None = None):
             # Pinned AND-semantics: the pair reports trimmable only when both
             # halves can trim, independent of upstream CacheList convention.
             return self.caches[0].is_trimmable() and self.caches[1].is_trimmable()
+
+        def can_trim(self, n: int) -> bool:
+            # n-token form: a pair can roll a verify window back only when
+            # BOTH halves cover it — the pool's undo log is the binding
+            # constraint at window boundaries.
+            for child in self.caches:
+                child_can_trim = getattr(child, "can_trim", None)
+                if callable(child_can_trim):
+                    if not child_can_trim(n):
+                        return False
+                elif not child.is_trimmable():
+                    return False
+            return True
 
         def reserve_indexer_capacity(self, *args, **kwargs):
             # Decline marker honored by qsa_mtp_outer_device_core_supported:

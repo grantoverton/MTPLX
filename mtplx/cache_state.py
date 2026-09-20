@@ -4480,10 +4480,35 @@ def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool =
 
 
 def rollback_after_verify(cache: list[Any], snapshot: CacheSnapshot, verified_tokens: int) -> None:
-    """Undo a speculative target verify pass."""
-    for entry in cache:
-        if _is_trimmable(entry) and hasattr(entry, "trim"):
-            entry.trim(verified_tokens)
+    """Undo a speculative target verify pass.
+
+    A cache-list pair can report untrimmable when only ONE child sits on a
+    state boundary (PoolingCache on a pool-window edge after a wide verify
+    update cleared its undo log). Skipping the whole entry then strands the
+    rejected verify tokens in the KV half permanently. When the pair-level
+    trim is unavailable, trim each child that can roll back so the KV half
+    is always rewound; children that genuinely cannot are counted loudly
+    instead of skipped silently.
+    """
+    n = int(verified_tokens)
+    states = snapshot.states if snapshot is not None else (None,) * len(cache)
+    for entry, state in zip(cache, states):
+        if state is not None:
+            # Captured as non-trimmable at snapshot time; restore_cache
+            # below reinstates it. Trimming on top would double-roll.
+            continue
+        if hasattr(entry, "trim") and _entry_can_trim(entry, n):
+            entry.trim(n)
+            continue
+        children = getattr(entry, "caches", None)
+        if children:
+            for child in children:
+                if hasattr(child, "trim") and _entry_can_trim(child, n):
+                    child.trim(n)
+                else:
+                    _rollback_refusal(child)
+        else:
+            _rollback_refusal(entry)
     restore_cache(cache, snapshot)
 
 
@@ -4594,6 +4619,13 @@ def trim_verified_window_to_prefix(
             return False
         before_offsets.append(offset)
 
+    for entry in cache:
+        # Preflight the REAL trim size before mutating anything: a pair whose
+        # pool half lacks undo coverage would half-trim (KV moves, pool
+        # refuses) and the caller's full-rollback fallback would then trim
+        # the KV a second time.
+        if not _entry_can_trim(entry, trim_tokens):
+            return False
     for entry, before_offset in zip(cache, before_offsets):
         trimmed = entry.trim(trim_tokens)
         if trimmed is not None and int(trimmed) != trim_tokens:
@@ -4775,3 +4807,38 @@ def _is_trimmable(entry: Any) -> bool:
         return bool(entry.is_trimmable())
     except Exception:
         return False
+
+
+_rollback_trim_refusals = 0
+_rollback_refusal_warned = False
+
+
+def _entry_can_trim(entry: Any, n: int) -> bool:
+    """n-token trimmability check.
+
+    ``is_trimmable()`` only certifies a one-token trim on conditionally
+    trimmable caches (PoolingCache at a window boundary); callers rolling
+    back a whole verify window need the n-token answer. Entries exposing
+    ``can_trim(n)`` answer exactly; everything else keeps the legacy
+    1-token gate.
+    """
+    can_trim = getattr(entry, "can_trim", None)
+    if callable(can_trim):
+        try:
+            return bool(can_trim(n))
+        except Exception:
+            return False
+    return _is_trimmable(entry)
+
+
+def _rollback_refusal(entry: Any) -> None:
+    global _rollback_trim_refusals, _rollback_refusal_warned
+    _rollback_trim_refusals += 1
+    if not _rollback_refusal_warned:
+        _rollback_refusal_warned = True
+        print(
+            "[mtplx] WARNING: cache rollback refusal — a verify window left "
+            "residual state (%s); output may drift. Further refusals are "
+            "counted but not logged." % type(entry).__name__,
+            file=sys.stderr,
+        )

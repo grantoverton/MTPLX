@@ -6503,11 +6503,27 @@ def _mtp_position_offset(
 def _rollback_mtp_cache(mtp_cache, offset: int) -> None:
     if not mtp_cache:
         return
+    from .cache_state import _entry_can_trim, _rollback_refusal
+
     for cache in mtp_cache:
         current = int(getattr(cache, "offset", 0))
         trim = max(0, current - offset)
-        if trim and hasattr(cache, "trim"):
+        if not trim:
+            continue
+        if hasattr(cache, "trim") and _entry_can_trim(cache, trim):
             cache.trim(trim)
+            continue
+        children = getattr(cache, "caches", None)
+        if children:
+            # Same pair-boundary case as rollback_after_verify: never leave
+            # the KV half holding rejected draft positions.
+            for child in children:
+                if hasattr(child, "trim") and _entry_can_trim(child, trim):
+                    child.trim(trim)
+                else:
+                    _rollback_refusal(child)
+        else:
+            _rollback_refusal(cache)
 
 
 def _add_timing(event: dict, key: str, elapsed_s: float) -> None:
