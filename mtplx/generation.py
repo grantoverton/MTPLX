@@ -5715,6 +5715,37 @@ _DEVICE_CORE_MAX_TOP_K = 32
 _DEVICE_CORE_HISTORY_RESERVE = 4096
 
 
+def _coupled_sampling_enabled() -> bool:
+    """MTPLX_COUPLED_SAMPLING: shared-Gumbel draft/target draws.
+
+    Draft picks x_i = argmax(log q_i + g_i) and the batched verifier emits
+    y_i = argmax(log p_i + g_i) with THE SAME per-position gumbel vector g_i
+    (derived from the round's draft-core seed). Emitted tokens are always
+    y_i ~ p_i, so the target marginal is preserved for ANY proposal rule;
+    when p ~= q the shared noise makes x_i == y_i far more often than the
+    min(1,p/q) collision rate. Only engages when the device draft core ran
+    (coupled draft draw) AND the sampled batched lane is live.
+    """
+    return _env_truthy("MTPLX_COUPLED_SAMPLING")
+
+
+def _coupled_round_keys(seed: int, n: int) -> list:
+    """Deterministic per-position gumbel keys for one verify round."""
+    return list(mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), n))
+
+
+def _coupled_pick_from_batch(batch, row: int, key) -> int:
+    """argmax(log p_row + g) over the batch's recorded support."""
+    ids_np = np.asarray(batch.token_ids[int(row)], dtype=np.int64)
+    probs_np = np.asarray(batch.probs[int(row)], dtype=np.float64)
+    keep = probs_np > 0
+    ids_np = ids_np[keep]
+    logp = np.log(probs_np[keep])
+    g = mx.random.gumbel((int(batch.vocab_size),), key=key)
+    g_sel = np.asarray(mx.take(g, mx.array(ids_np, dtype=mx.int32)))
+    return int(ids_np[int(np.argmax(logp + g_sel))])
+
+
 def _device_draft_q_arrays(
     row: mx.array,
     *,
@@ -5874,6 +5905,7 @@ def _make_device_draft_core_inner(
     top_k = int(draft_sampler.top_k)
     top_p = float(draft_sampler.top_p)
     greedy = temperature <= 0
+    coupled_sampling = _coupled_sampling_enabled() and not greedy
 
     base_offset = _mtp_cache_offset(mtp_cache)
     promoted, failures = promote_kv_cache_offsets(
@@ -5936,12 +5968,30 @@ def _make_device_draft_core_inner(
                 )
                 if frspec_mapped:
                     top_idx = mx.take(frspec_ids, top_idx)
-                cdf = mx.cumsum(q_norm, axis=-1)
-                u = mx.random.uniform(key=level_keys[level - 1])
-                pick = mx.minimum(
-                    (cdf <= u).sum(), int(top_idx.shape[0]) - 1
-                ).astype(mx.int32)
-                next_tok = top_idx[pick].reshape(1, 1)
+                if coupled_sampling:
+                    # Shared-Gumbel draft draw: same marginal as the CDF pick
+                    # over the truncated support, but the verifier's coupled
+                    # pick uses the identical key, so x_i == y_i whenever
+                    # p ~= q on this support.
+                    _g_vocab = (
+                        frspec_full_vocab
+                        if frspec_ids is not None and frspec_full_vocab > 0
+                        else vocab_size
+                    )
+                    _g_i = mx.random.gumbel(
+                        (int(_g_vocab),), key=level_keys[level - 1]
+                    )
+                    _sel = mx.log(
+                        mx.maximum(q_norm, 1e-30).astype(mx.float32)
+                    ) + mx.take(_g_i, top_idx)
+                    next_tok = top_idx[mx.argmax(_sel)].reshape(1, 1)
+                else:
+                    cdf = mx.cumsum(q_norm, axis=-1)
+                    u = mx.random.uniform(key=level_keys[level - 1])
+                    pick = mx.minimum(
+                        (cdf <= u).sum(), int(top_idx.shape[0]) - 1
+                    ).astype(mx.int32)
+                    next_tok = top_idx[pick].reshape(1, 1)
                 q_ids.append(top_idx)
                 q_probs.append(q_norm)
             tokens.append(next_tok)
@@ -5954,7 +6004,7 @@ def _make_device_draft_core_inner(
         inputs=_device_core_state_tree(mtp_cache),
         outputs=_device_core_state_tree(mtp_cache),
     )
-    smoke_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth)
+    smoke_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth + 1)
     smoke = compiled(hidden, token_ids, smoke_keys)
     _eval(smoke)
     _rollback_mtp_cache(mtp_cache, base_offset)
@@ -5985,7 +6035,11 @@ def _run_device_draft_core(
     seed: int,
 ) -> tuple[list[int], list[SparseDistribution | None]]:
     depth = int(core["depth"])
-    level_keys = mx.random.split(mx.random.key(int(seed) & 0x7FFFFFFF), depth)
+    # depth+1 keys: [0..depth-1] drive the chain's per-level draws and the
+    # coupled verifier uses [depth] for the all-accept bonus row.
+    level_keys = mx.random.split(
+        mx.random.key(int(seed) & 0x7FFFFFFF), depth + 1
+    )
     result = core["fn"](hidden, mx.array([[primary]]), level_keys)
     _eval(result)
     tokens = [int(t.reshape(-1)[0].item()) for t in result[:depth]]
@@ -9269,6 +9323,10 @@ def generate_mtpk(
                         "step": event.get("step"),
                         "primary": event.get("primary"),
                         "drafts": [d.get("token") for d in event.get("drafts", [])],
+                        "draft_top": [
+                            {"ids": d.get("top_ids"), "q": d.get("top_q")}
+                            for d in event.get("drafts", [])
+                        ],
                         "accepted": event.get("accepted_depths"),
                         "rejected_at": event.get("rejected_at_depth"),
                         "correction": event.get("correction"),
@@ -9999,7 +10057,10 @@ def generate_mtpk(
         and mtp_corrector is None
         and mtp_topk_reranker is None
         and not adapter_ensemble_q
-        and not online_hidden_enabled
+        and (
+            not online_hidden_enabled
+            or online_hidden_corrector_key == "global"
+        )
         and not online_correction_cache
         and not prompt_correction_cache
         and not target_prefix_verify
@@ -10030,7 +10091,10 @@ def generate_mtpk(
         and mtp_corrector is None
         and mtp_topk_reranker is None
         and not adapter_ensemble_q
-        and not online_hidden_enabled
+        and (
+            not online_hidden_enabled
+            or online_hidden_corrector_key == "global"
+        )
         and not online_correction_cache
         and not prompt_correction_cache
         and not target_prefix_verify
@@ -10344,6 +10408,8 @@ def generate_mtpk(
         adaptive_width_decision_margins: list[float] = []
         draft_tokens: list[int | None] = []
         draft_probs: list[np.ndarray | None] = []
+        _coupled_seed: int | None = None
+        _coupled_depth = 0
         # Parallel to draft_tokens when _draft_conf_trace: p(drafted) per
         # depth, None where a lane has no draft logits (device cores, cc).
         draft_confidences: list[float | None] = []
@@ -11313,12 +11379,16 @@ def generate_mtpk(
                             ),
                         }
                     started = time.perf_counter()
+                    _coupled_draw_seed = int(rng.integers(0, 2**31 - 1))
                     core_tokens, core_qs = _run_device_draft_core(
                         device_core,
                         draft_hidden,
                         int(primary),
-                        seed=int(rng.integers(0, 2**31 - 1)),
+                        seed=_coupled_draw_seed,
                     )
+                    if _coupled_sampling_enabled():
+                        _coupled_seed = _coupled_draw_seed
+                        _coupled_depth = int(device_core["depth"])
                     elapsed_draft = time.perf_counter() - started
                     draft_time += elapsed_draft
                     device_core_calls += 1
@@ -11525,7 +11595,28 @@ def generate_mtpk(
                 _chain_tok = _top_idx[_pick].reshape(1, 1)
                 _chain_pending.append((_top_idx, _q_norm, _chain_tok))
                 _chain_hidden = _chain_hidden_level[:, -1:, :]
+                # Store the RAW level hidden for the corrector residual
+                # accounting, then feed the corrected hidden to the next
+                # level — mirrors the per-step lane's base/corrected split.
                 draft_hidden_for_update.append(_chain_hidden)
+                if (
+                    online_hidden_enabled
+                    and _chain_depth + 1 <= online_hidden_max_feed_depth
+                    and _chain_depth + 1 < cycle_depth
+                ):
+                    _online_key = _chain_depth + 1
+                    _online_delta = online_hidden_deltas.get(_online_key)
+                    if _online_delta is not None and (
+                        online_hidden_update_counts.get(_online_key, 0)
+                        >= online_hidden_corrector_warmup
+                    ):
+                        _chain_hidden = _chain_hidden + (
+                            float(online_hidden_corrector_alpha)
+                            * _online_delta.astype(_chain_hidden.dtype)
+                        )
+                        online_hidden_apply_counts[_online_key] = (
+                            online_hidden_apply_counts.get(_online_key, 0) + 1
+                        )
             _eval(
                 _chain_hidden,
                 *[arr for _pend in _chain_pending for arr in _pend],
@@ -11569,6 +11660,8 @@ def generate_mtpk(
                     },
                     "mtp_corrector": None,
                     "draft_core": "sampled-chain",
+                    "top_ids": [int(t) for t in np.asarray(_top_idx)[:24]],
+                    "top_q": [float(v) for v in np.asarray(_q_norm)[:24]],
                 }
                 if _chain_offsets[_chain_index] is not None:
                     _chain_event["position_offset"] = int(
@@ -12581,28 +12674,58 @@ def generate_mtpk(
                 draft_q = draft_probs[depth_index]
                 if draft_q is None:
                     raise RuntimeError("non-greedy MTP requires draft distributions")
-                p = target_distribution_batch.probability(depth_index, draft_token)
-                q = (
-                    draft_q.probability(draft_token)
-                    if isinstance(draft_q, SparseDistribution)
-                    else float(draft_q[draft_token])
+                _coupled_row = (
+                    _coupled_seed is not None
+                    and _bv is None
+                    and not _penalties_active
+                    and not _steer_active
+                    and constraint is None
                 )
-                accept_prob = (
-                    1.0 if q <= 0 and p > 0 else (0.0 if q <= 0 else min(1.0, p / q))
-                )
+                if _coupled_row:
+                    # Emit the coupled target pick y_i = argmax(log p + g_i)
+                    # unconditionally; continue the block only while the
+                    # coupled draft drew the same token. y_i ~ p_i for any
+                    # proposal, so the committed marginal is unchanged.
+                    _coupled_keys = _coupled_round_keys(
+                        _coupled_seed, _coupled_depth + 1
+                    )
+                    correction = _coupled_pick_from_batch(
+                        target_distribution_batch,
+                        depth_index,
+                        _coupled_keys[depth_index],
+                    )
+                    accepted_now = int(draft_token) == correction
+                    accept_prob = 1.0 if accepted_now else 0.0
+                else:
+                    p = target_distribution_batch.probability(
+                        depth_index, draft_token
+                    )
+                    q = (
+                        draft_q.probability(draft_token)
+                        if isinstance(draft_q, SparseDistribution)
+                        else float(draft_q[draft_token])
+                    )
+                    accept_prob = (
+                        1.0
+                        if q <= 0 and p > 0
+                        else (0.0 if q <= 0 else min(1.0, p / q))
+                    )
                 if _bv is not None:
                     # Block verification: the CONDITIONAL accept probability
                     # a_d = w_d / w_{d-1}, precomputed from the same rows.
                     # Reduces to min(1, p/q) whenever the ladder is still at 1.
                     accept_prob = _bv.accept_probability[depth_index]
-                accepted_now = float(rng.random()) <= accept_prob
+                if not _coupled_row:
+                    accepted_now = float(rng.random()) <= accept_prob
                 target_p_for_cache = (
                     target_distribution_batch.to_distribution(depth_index)
                     if online_correction_cache
                     and depth_index + 1 >= online_correction_cache_min_depth
                     else None
                 )
-                if accepted_now:
+                if _coupled_row:
+                    pass  # correction already holds the coupled target pick y_i
+                elif accepted_now:
                     correction = draft_token
                 elif _bv is not None:
                     # The block law's SCALED residual (c_{d-1}*p - q)+, one
@@ -13058,7 +13181,19 @@ def generate_mtpk(
                 ):
                     bonus = int(target_prefix_tokens[len(draft_tokens)])
                 elif target_distribution_batch is not None and not lazy_bonus_verify:
-                    bonus = target_distribution_batch.sample(len(draft_tokens), rng)
+                    if _coupled_seed is not None:
+                        _coupled_keys = _coupled_round_keys(
+                            _coupled_seed, _coupled_depth + 1
+                        )
+                        bonus = _coupled_pick_from_batch(
+                            target_distribution_batch,
+                            len(draft_tokens),
+                            _coupled_keys[len(draft_tokens)],
+                        )
+                    else:
+                        bonus = target_distribution_batch.sample(
+                            len(draft_tokens), rng
+                        )
                 elif (
                     target_distributions is not None
                     and not lazy_bonus_verify
