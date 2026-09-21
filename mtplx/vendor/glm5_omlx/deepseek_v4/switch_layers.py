@@ -56,7 +56,24 @@ def _nax_prefers_stock(num_routes: int) -> bool:
     return num_routes >= _NAX_STOCK_MIN_ROUTES
 
 
+# MTPLX_GLM5_MOE_SORT_MIN_ROUTES overrides the route-count threshold at
+# which SwitchGLU sorts/scatters for every bit-width (e.g. =32 engages the
+# native gather-QMM block kernels + fused weighted-sum epilogue at S=4,
+# where indices.size is 32). Read per call so tests can monkeypatch.
+def _mtplx_sort_min_routes_override() -> Optional[int]:
+    raw = os.environ.get("MTPLX_GLM5_MOE_SORT_MIN_ROUTES", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _sort_threshold(*projections) -> int:
+    override = _mtplx_sort_min_routes_override()
+    if override is not None:
+        return override
     if all(
         isinstance(p, QuantizedSwitchLinear)
         and p.mode == "affine"
