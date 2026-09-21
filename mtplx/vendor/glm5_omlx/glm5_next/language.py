@@ -48,6 +48,7 @@ import time as _prof_time
 from .gated_delta import gated_delta_update
 from .hc_fused import glm5_hc_normalized_norm
 from .kda_conv_norm import glm5_kda_conv_norm
+from .kda_o_norm import glm5_kda_o_norm
 
 # GLM_PROFILE_LAYERS=<path>: per-layer eager sync timing (diagnostic only --
 # forces an mx.eval per layer so totals inflate, but reveals distribution).
@@ -391,7 +392,14 @@ class Glm5NextLinearAttention(nn.Module):
         gate = linear_forward(self.g_b_proj, ga_o).reshape(
             B, S, self.num_heads, self.head_dim
         )
-        out = self.o_norm(out, gate).reshape(B, S, -1)
+        # T4: single-dispatch gated RMSNorm at verify widths (the model's
+        # only hand-rolled norm, ~11 eager ops otherwise).
+        out_fused = glm5_kda_o_norm(
+            out, gate, self.o_norm.weight, self.o_norm.eps
+        )
+        out = (
+            out_fused if out_fused is not None else self.o_norm(out, gate)
+        ).reshape(B, S, -1)
         return linear_forward(self.o_proj, out)
 
 
