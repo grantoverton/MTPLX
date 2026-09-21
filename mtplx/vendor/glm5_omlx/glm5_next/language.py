@@ -46,6 +46,7 @@ import os as _os_prof
 import time as _prof_time
 
 from .gated_delta import gated_delta_update
+from .hc_fused import glm5_hc_normalized_norm
 
 # GLM_PROFILE_LAYERS=<path>: per-layer eager sync timing (diagnostic only --
 # forces an mx.eval per layer so totals inflate, but reveals distribution).
@@ -939,8 +940,18 @@ class Glm5NextDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         residual = x
-        xc, post, comb = self.attn_hc(x)
-        r = self.self_attn(self.input_layernorm(xc), mask, cache)
+        # T1: single-dispatch HC collapse+mix+sinkhorn+norm at verify widths
+        # (B=1, 1<S<=8). The HC math never reads the attention mask, but the
+        # fused path is only validated single-stream -- keep masked calls eager.
+        fused = None
+        if mask is None:
+            fused = glm5_hc_normalized_norm(self.attn_hc, self.input_layernorm, x)
+        if fused is not None:
+            collapsed, post, comb = fused
+        else:
+            xc, post, comb = self.attn_hc(x)
+            collapsed = self.input_layernorm(xc)
+        r = self.self_attn(collapsed, mask, cache)
         x = hc_expand(r, residual, post, comb)
         # Compile the FFN block only for single-stream decode (B=1, S=1) -- the shape it
         # was validated on and where its win lives. Compiling the 288-expert MoE at a
@@ -951,13 +962,24 @@ class Glm5NextDecoderLayer(nn.Module):
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
-        return self._ffn_block(x)
+        return self._ffn_block(x, mask is None)
 
-    def _ffn_block(self, x: mx.array) -> mx.array:
+    def _ffn_block(self, x: mx.array, fused_ok: bool = True) -> mx.array:
         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
         residual = x
-        xc, post, comb = self.ffn_hc(x)
-        m = self.mlp(self.post_attention_layernorm(xc))
+        fused = (
+            glm5_hc_normalized_norm(
+                self.ffn_hc, self.post_attention_layernorm, x
+            )
+            if fused_ok
+            else None
+        )
+        if fused is not None:
+            collapsed, post, comb = fused
+        else:
+            xc, post, comb = self.ffn_hc(x)
+            collapsed = self.post_attention_layernorm(xc)
+        m = self.mlp(collapsed)
         return hc_expand(m, residual, post, comb)
 
 
