@@ -400,6 +400,7 @@ def test_summary_shape_is_json_primitive_only():
         "arm_events",
         "disarm_events",
         "penalized_positions",
+        "hard_bans",
         "max_match_len",
         "tool_call_mask",
         "span_suppressed_positions",
@@ -586,3 +587,65 @@ def test_generate_mtpk_without_guard_stays_on_cycle_and_stats_empty(monkeypatch)
     )
     assert list(out.tokens) == _pure_cycle(0, len(out.tokens))
     assert out.stats.loop_guard == {}
+
+
+# --- hard-break escalation (2026-09-21, GLM-5.3 trap escapes) ---
+
+
+def test_hard_break_match_len_bans_the_continuation():
+    guard = LoopGuard(_config(hard_break_match_len=10, penalty_cap=1e9))
+    guard.armed = True  # steering unit test: bypass the arming detector
+    prefix = list(range(100, 160))
+    block = [1, 2, 3, 4, 5, 6, 7, 8]
+    # Suffix match of 7 < threshold: ordinary (uncapped) penalty, no ban.
+    shallow = prefix + block + [42, 43] + block[:-1]
+    penalties = guard.penalties_for(shallow)
+    assert penalties is not None
+    assert penalties[8] < float("inf")
+    assert guard.hard_bans == 0
+    # Suffix match of 19 >= threshold: the continuation is banned outright.
+    long_block = list(range(50, 70))
+    deep = prefix + long_block + [42, 43] + long_block[:-1]
+    penalties = guard.penalties_for(deep)
+    assert penalties[long_block[-1]] == float("inf")
+    assert guard.hard_bans == 1
+    assert "hard_bans" in guard.summary()
+
+
+def test_hard_break_steered_escalates_after_n_penalized_positions():
+    guard = LoopGuard(_config(hard_break_steered=2, penalty_cap=1e9))
+    guard.armed = True
+    block = [1, 2, 3, 4, 5, 6, 7, 8]
+    working = list(range(100, 160)) + block + [42, 43] + block[:-1]
+    # Positions 1 and 2 are still steered (penalty), not banned.
+    assert guard.penalties_for(working)[8] < float("inf")
+    assert guard.penalties_for(working)[8] < float("inf")
+    # The third penalized position means steering is being eaten — escalate.
+    assert guard.penalties_for(working)[8] == float("inf")
+    assert guard.hard_bans == 1
+
+
+def test_hard_break_ban_drives_the_logit_to_neg_inf():
+    guard = LoopGuard(_config(hard_break_match_len=4))
+    guard.armed = True
+    block = [1, 2, 3, 4, 5, 6, 7, 8]
+    working = list(range(100, 160)) + block + [42, 43] + block[:-1]
+    penalties = guard.penalties_for(working)
+    assert penalties[8] == float("inf")
+    logits = mx.zeros(64)
+    steered = apply_penalties_mlx(logits, None, penalty_overlay=penalties)
+    assert float(np.asarray(steered)[8]) == float("-inf")
+    # Untouched logits stay finite — the ban is surgical, not a row-wide mask.
+    assert np.isfinite(np.asarray(steered)[:8]).all()
+
+
+def test_disarm_resets_the_steered_escalation_counter():
+    guard = LoopGuard(
+        _config(hard_break_steered=1, disarm_after=16, scan_interval=1)
+    )
+    block = [7, 3, 9, 4, 11, 5, 13, 6]
+    loop = _looping_tokens(block, repeats=8)
+    assert guard.observe(loop) == "armed"
+    grown = loop + list(range(1000, 1000 + 20))
+    assert guard.observe(grown) == "disarmed"
+    assert guard._steered_this_arm == 0

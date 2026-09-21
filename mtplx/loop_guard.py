@@ -21,6 +21,20 @@ detected, so normal decoding is bit-exact untouched:
    ``penalty * growth ** (match_len - allowed_length)`` (capped at
    ``penalty_cap``) — small nudges at the threshold, a hard wall for deep
    cycles. Everything else in the distribution is untouched.
+2b. HARD BREAK (opt-in escalation): steering loses when the model's loop
+   continuation is confident enough to eat the capped penalty (~30% of armed
+   episodes on GLM-5.3 thinking marathons, 2026-09-21). Two escalation
+   triggers turn the continuation's penalty into ``inf`` — a hard ban the
+   sampler cannot overcome (the logits pipeline treats -inf like a grammar
+   mask, so the token is simply absent):
+   * ``hard_break_match_len``: a single qualifying suffix match this deep
+     (e.g. 40+ verbatim tokens) is an unambiguous cycle — ban immediately.
+   * ``hard_break_steered``: this many penalized positions in the current
+     armed episode means steering is being eaten repeatedly — escalate any
+     further qualifying match to a ban.
+   Both default 0 (off). The ban is per-position: the loop token banned at
+   one position cannot continue the cycle, and if the next-best token also
+   cycles the guard bans that continuation at the next position.
 3. DISARM: after ``disarm_after`` tokens without a penalized position the
    guard disarms and decoding returns to the exact unpenalized path.
 
@@ -93,6 +107,12 @@ class LoopGuardConfig:
     growth: float = 1.3
     penalty_cap: float = 16.0
     max_candidates: int = 32
+    # Hard-break escalation (0 = off). A qualifying match at least
+    # ``hard_break_match_len`` tokens deep, or ``hard_break_steered``
+    # penalized positions already eaten in this armed episode, turns the
+    # continuation's penalty into inf — a hard ban, not a nudge.
+    hard_break_match_len: int = 0
+    hard_break_steered: int = 0
     # Hysteresis.
     disarm_after: int = 256
     # Structured-span masking: single-token markers that open/close a span in
@@ -201,6 +221,12 @@ def loop_guard_config_from_env(
         growth=max(1.0, _env_float("MTPLX_LOOP_GUARD_GROWTH", 1.3)),
         penalty_cap=max(0.0, _env_float("MTPLX_LOOP_GUARD_PENALTY_CAP", 16.0)),
         max_candidates=max(1, _env_int("MTPLX_LOOP_GUARD_MAX_CANDIDATES", 32)),
+        hard_break_match_len=max(
+            0, _env_int("MTPLX_LOOP_GUARD_HARD_BREAK_MATCH", 0)
+        ),
+        hard_break_steered=max(
+            0, _env_int("MTPLX_LOOP_GUARD_HARD_BREAK_AFTER", 0)
+        ),
         disarm_after=max(16, _env_int("MTPLX_LOOP_GUARD_DISARM_AFTER", 256)),
         mask_open_token=markers[0] if markers else None,
         mask_close_token=markers[1] if markers else None,
@@ -221,11 +247,13 @@ class LoopGuard:
         self.arm_events = 0
         self.disarm_events = 0
         self.penalized_positions = 0
+        self.hard_bans = 0
         self.max_match_len = 0
         self.span_suppressed_positions = 0
         self.last_arm_token_count = 0
         self._last_scan_at = -1
         self._last_fire_at = 0
+        self._steered_this_arm = 0
         # Tool-call span mask over the committed tokens. _mask[i] is True when
         # token i lies inside a masked span (markers included);
         # _in_span_after[i] is the span state after consuming token i, kept so
@@ -308,6 +336,7 @@ class LoopGuard:
             if count - anchor >= config.disarm_after:
                 self.armed = False
                 self.disarm_events += 1
+                self._steered_this_arm = 0
                 return "disarmed"
             return None
         if count < config.min_tokens:
@@ -320,6 +349,7 @@ class LoopGuard:
             self.arm_events += 1
             self.last_arm_token_count = count
             self._last_fire_at = count
+            self._steered_this_arm = 0
             return "armed"
         return None
 
@@ -400,11 +430,20 @@ class LoopGuard:
             ):
                 continue
             continuation = int(arr[i + 1])
-            value = min(
-                config.penalty_cap,
-                config.penalty
-                * config.growth ** float(match_len - config.allowed_length),
-            )
+            if config.hard_break_match_len > 0 and match_len >= (
+                config.hard_break_match_len
+            ):
+                value = float("inf")
+            elif config.hard_break_steered > 0 and self._steered_this_arm >= (
+                config.hard_break_steered
+            ):
+                value = float("inf")
+            else:
+                value = min(
+                    config.penalty_cap,
+                    config.penalty
+                    * config.growth ** float(match_len - config.allowed_length),
+                )
             if value <= 0.0:
                 continue
             if value > penalties.get(continuation, 0.0):
@@ -419,6 +458,9 @@ class LoopGuard:
         if not penalties:
             return None
         self.penalized_positions += 1
+        self._steered_this_arm += 1
+        if float("inf") in penalties.values():
+            self.hard_bans += 1
         # Track fire position in true-sequence coordinates (not the
         # window-clamped ``n``) so the disarm hysteresis in observe() works.
         self._last_fire_at = len(working)
@@ -431,6 +473,7 @@ class LoopGuard:
             "arm_events": int(self.arm_events),
             "disarm_events": int(self.disarm_events),
             "penalized_positions": int(self.penalized_positions),
+            "hard_bans": int(self.hard_bans),
             "max_match_len": int(self.max_match_len),
             "tool_call_mask": bool(self._masking),
             "span_suppressed_positions": int(self.span_suppressed_positions),
