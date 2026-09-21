@@ -47,6 +47,7 @@ import time as _prof_time
 
 from .gated_delta import gated_delta_update
 from .hc_fused import glm5_hc_normalized_norm
+from .kda_conv_norm import glm5_kda_conv_norm
 
 # GLM_PROFILE_LAYERS=<path>: per-layer eager sync timing (diagnostic only --
 # forces an mx.eval per layer so totals inflate, but reveals distribution).
@@ -311,35 +312,57 @@ class Glm5NextLinearAttention(nn.Module):
             conv_state = mx.zeros(
                 (B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype
             )
-        conv_input = mx.concatenate([conv_state, mixed], axis=1)
-        if cache is not None:
-            state_size = self.conv_kernel_size - 1
-            if has_right_padding:
-                valid_lengths = mx.sum(mask, axis=-1).astype(mx.int32)
-                state_indices = valid_lengths[:, None] + mx.arange(state_size)[None]
-                state_indices = mx.broadcast_to(
-                    state_indices[..., None],
-                    (B, state_size, self.conv_dim),
-                )
-                cache[0] = mx.contiguous(
-                    mx.take_along_axis(conv_input, state_indices, axis=1)
-                )
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -state_size:, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+        # T2: single-dispatch conv tape + q/k l2norm at verify widths. The
+        # right-padding path gathers a custom state tail, so it stays eager.
+        fused_conv = (
+            glm5_kda_conv_norm(mixed, conv_state, self.conv1d.weight)
+            if not has_right_padding
+            else None
+        )
+        if fused_conv is not None:
+            q, k, v, new_state = fused_conv
+            if cache is not None:
+                cache[0] = new_state
+            q = q.reshape(B, S, self.num_heads, self.head_dim)
+            k = k.reshape(B, S, self.num_heads, self.head_dim)
+            v = v.reshape(B, S, self.num_heads, self.head_dim)
+        else:
+            conv_input = mx.concatenate([conv_state, mixed], axis=1)
+            if cache is not None:
+                state_size = self.conv_kernel_size - 1
+                if has_right_padding:
+                    valid_lengths = mx.sum(mask, axis=-1).astype(mx.int32)
+                    state_indices = valid_lengths[:, None] + mx.arange(state_size)[
+                        None
+                    ]
+                    state_indices = mx.broadcast_to(
+                        state_indices[..., None],
+                        (B, state_size, self.conv_dim),
+                    )
+                    cache[0] = mx.contiguous(
+                        mx.take_along_axis(conv_input, state_indices, axis=1)
+                    )
+                else:
+                    cache[0] = mx.contiguous(conv_input[:, -state_size:, :])
+            conv_out = nn.silu(self.conv1d(conv_input))
 
-        q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)
-        q = q.reshape(B, S, self.num_heads, self.head_dim)
-        k = k.reshape(B, S, self.num_heads, self.head_dim)
-        v = v.reshape(B, S, self.num_heads, self.head_dim)
+            q, k, v = mx.split(
+                conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1
+            )
+            q = q.reshape(B, S, self.num_heads, self.head_dim)
+            k = k.reshape(B, S, self.num_heads, self.head_dim)
+            v = v.reshape(B, S, self.num_heads, self.head_dim)
 
         fg = self.forget_gate
         a = linear_forward(fg.f_b_proj, fa_o).reshape(
             B, S, self.num_heads, self.head_dim
         )
-        in_dtype = q.dtype
-        q = (_l2norm(q.astype(mx.float32)) * (self.head_dim**-0.5)).astype(in_dtype)
-        k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
+        if fused_conv is None:
+            in_dtype = q.dtype
+            q = (_l2norm(q.astype(mx.float32)) * (self.head_dim**-0.5)).astype(
+                in_dtype
+            )
+            k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
 
         if cache is not None and _VERIFY_CAPTURE.get():
             # Retain the rows the recurrence consumed (plus the pre-conv
