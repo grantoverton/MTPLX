@@ -49,6 +49,7 @@ from .gated_delta import gated_delta_update
 from .hc_fused import glm5_hc_normalized_norm
 from .kda_conv_norm import glm5_kda_conv_norm
 from .kda_o_norm import glm5_kda_o_norm
+from .moe_router import glm5_moe_router_topk
 
 # GLM_PROFILE_LAYERS=<path>: per-layer eager sync timing (diagnostic only --
 # forces an mx.eval per layer so totals inflate, but reveals distribution).
@@ -898,6 +899,19 @@ class Glm5NextMoEGate(nn.Module):
 
     def __call__(self, x):
         logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        # T5: single-dispatch router tail at verify widths (n_group==1
+        # dead-codes the group-mask block; fused kernel reproduces
+        # argpartition's stable descending order bit-exactly).
+        fused = glm5_moe_router_topk(
+            logits,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.n_group,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+        )
+        if fused is not None:
+            return fused
         return group_expert_select(
             logits,
             self.e_score_correction_bias,
