@@ -941,11 +941,9 @@ class Glm5NextDecoderLayer(nn.Module):
     ) -> mx.array:
         residual = x
         # T1: single-dispatch HC collapse+mix+sinkhorn+norm at verify widths
-        # (B=1, 1<S<=8). The HC math never reads the attention mask, but the
-        # fused path is only validated single-stream -- keep masked calls eager.
-        fused = None
-        if mask is None:
-            fused = glm5_hc_normalized_norm(self.attn_hc, self.input_layernorm, x)
+        # (B=1, 1<S<=8). The HC math never reads the attention mask -- it only
+        # feeds self_attn -- so the fused dispatch is safe with or without one.
+        fused = glm5_hc_normalized_norm(self.attn_hc, self.input_layernorm, x)
         if fused is not None:
             collapsed, post, comb = fused
         else:
@@ -962,17 +960,13 @@ class Glm5NextDecoderLayer(nn.Module):
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
-        return self._ffn_block(x, mask is None)
+        return self._ffn_block(x)
 
-    def _ffn_block(self, x: mx.array, fused_ok: bool = True) -> mx.array:
+    def _ffn_block(self, x: mx.array) -> mx.array:
         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
         residual = x
-        fused = (
-            glm5_hc_normalized_norm(
-                self.ffn_hc, self.post_attention_layernorm, x
-            )
-            if fused_ok
-            else None
+        fused = glm5_hc_normalized_norm(
+            self.ffn_hc, self.post_attention_layernorm, x
         )
         if fused is not None:
             collapsed, post, comb = fused

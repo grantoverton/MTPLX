@@ -6,7 +6,8 @@ branch RMSNorm) through the decoder-layer boundary at verify widths. Covers:
 (a) fused == eager numerics at S=1 (gate-off, bit-identical) and S=4
     (fused, bf16-rounding tolerance) for a KDA+MoE layer,
 (b) MTPLX_GLM5_HC_FUSED=0 returns bit-identical eager output,
-(c) the shape gate falls back at S=16 and under a mask,
+(c) the shape gate falls back at S=16, while a masked call still fuses
+    (the HC math never reads the mask -- it only feeds self_attn),
 (d) the eval'd primitive census actually shrinks.
 An anti-vacuous counter asserts the fused dispatch ran on the fused arm.
 """
@@ -182,7 +183,7 @@ def test_env_zero_is_bit_identical_eager(layer, monkeypatch):
     assert (reference == off).all().item(), "env=0 output diverged from eager"
 
 
-def test_shape_gate_fallback_s16_and_mask(layer, monkeypatch):
+def test_shape_gate_fallback_s16(layer, monkeypatch):
     calls = {"n": 0}
     orig = hc_fused.glm5_hc_normalized_norm
 
@@ -202,12 +203,34 @@ def test_shape_gate_fallback_s16_and_mask(layer, monkeypatch):
     mx.eval(out16)
     assert calls["n"] == 0, "S=16 must not reach the fused dispatch"
 
+
+def test_masked_call_still_fuses(layer, monkeypatch):
+    # A real attention mask only feeds self_attn; the HC collapse must still
+    # take the fused dispatch and match the eager chain bit-for-bit.
     mx.random.seed(9)
     x4 = (mx.random.normal((1, 4, 4, 4096)) * 0.5).astype(mx.bfloat16)
     mask = mx.ones((1, 4), dtype=mx.bool_)
-    out_masked = _forward(layer, x4, mask=mask)
-    mx.eval(out_masked)
-    assert calls["n"] == 0, "masked calls must not reach the fused dispatch"
+
+    monkeypatch.setenv("MTPLX_GLM5_HC_FUSED", "0")
+    eager = _forward(layer, x4, mask=mask)
+    mx.eval(eager)
+
+    calls = {"n": 0}
+    orig = hc_fused.glm5_hc_normalized_norm
+
+    def counting(*a, **k):
+        r = orig(*a, **k)
+        if r is not None:
+            calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(glm5_lang, "glm5_hc_normalized_norm", counting)
+    monkeypatch.setenv("MTPLX_GLM5_HC_FUSED", "1")
+    fused = _forward(layer, x4, mask=mask)
+    mx.eval(fused)
+
+    assert calls["n"] == 2, "masked call did not reach the fused dispatch"
+    assert (fused == eager).all().item(), "masked fused output diverged"
 
 
 _VIEW_PRIMS = {
