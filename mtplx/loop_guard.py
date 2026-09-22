@@ -35,6 +35,17 @@ detected, so normal decoding is bit-exact untouched:
    Both default 0 (off). The ban is per-position: the loop token banned at
    one position cannot continue the cycle, and if the next-best token also
    cycles the guard bans that continuation at the next position.
+2c. THINK-CLOSE (opt-in, last resort): when the ban ladder has been eaten
+   ``think_close_after`` times in one armed episode, the loop is not
+   recoverable — the guard then emits a single *boost* overlay on the
+   ``</think>`` token (negative penalty, logit +1e6), so the next sampled
+   token closes the thinking block and the model answers from whatever
+   reasoning exists. This is the one deliberately non-sampled intervention:
+   the token is forced, not chosen — it fires only inside a confirmed
+   pathological episode, at most once per episode, and never inside a
+   tool-call span. ``think_close_after=0`` (default) disables it entirely;
+   it also requires ``think_close_token`` (resolved from the tokenizer's
+   single-token ``</think>`` id) to be set.
 3. DISARM: after ``disarm_after`` tokens without a penalized position the
    guard disarms and decoding returns to the exact unpenalized path.
 
@@ -113,6 +124,11 @@ class LoopGuardConfig:
     # continuation's penalty into inf — a hard ban, not a nudge.
     hard_break_match_len: int = 0
     hard_break_steered: int = 0
+    # Think-close escalation (0 = off). After ``think_close_after`` hard bans
+    # in one armed episode, force ``think_close_token`` once — the loop is
+    # not recoverable, so the model is walked out of the thinking block.
+    think_close_after: int = 0
+    think_close_token: int | None = None
     # Hysteresis.
     disarm_after: int = 256
     # Structured-span masking: single-token markers that open/close a span in
@@ -143,6 +159,26 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _single_token_id(tokenizer: Any, text: str) -> int | None:
+    """Resolve ``text`` to a single vocab id, else None."""
+    if tokenizer is None:
+        return None
+    encode = getattr(tokenizer, "encode", None)
+    if encode is None:
+        return None
+    try:
+        ids = encode(text, add_special_tokens=False)
+    except TypeError:
+        ids = encode(text)
+    except Exception:
+        return None
+    try:
+        ids = [int(token) for token in ids]
+    except (TypeError, ValueError):
+        return None
+    return ids[0] if len(ids) == 1 else None
+
+
 def tool_call_marker_ids(tokenizer: Any) -> tuple[int, int] | None:
     """Resolve single-token ``<tool_call>``/``</tool_call>`` ids, else None.
 
@@ -150,27 +186,8 @@ def tool_call_marker_ids(tokenizer: Any) -> tuple[int, int] | None:
     tokenizer where either marker splits into multiple tokens (or that has no
     such markers at all) gets no masking rather than approximate masking.
     """
-    if tokenizer is None:
-        return None
-    encode = getattr(tokenizer, "encode", None)
-    if encode is None:
-        return None
-
-    def _single_id(text: str) -> int | None:
-        try:
-            ids = encode(text, add_special_tokens=False)
-        except TypeError:
-            ids = encode(text)
-        except Exception:
-            return None
-        try:
-            ids = [int(token) for token in ids]
-        except (TypeError, ValueError):
-            return None
-        return ids[0] if len(ids) == 1 else None
-
-    open_id = _single_id("<tool_call>")
-    close_id = _single_id("</tool_call>")
+    open_id = _single_token_id(tokenizer, "<tool_call>")
+    close_id = _single_token_id(tokenizer, "</tool_call>")
     if open_id is None or close_id is None or open_id == close_id:
         return None
     return open_id, close_id
@@ -227,6 +244,10 @@ def loop_guard_config_from_env(
         hard_break_steered=max(
             0, _env_int("MTPLX_LOOP_GUARD_HARD_BREAK_AFTER", 0)
         ),
+        think_close_after=max(
+            0, _env_int("MTPLX_LOOP_GUARD_THINK_CLOSE_AFTER", 0)
+        ),
+        think_close_token=_single_token_id(tokenizer, "</think>"),
         disarm_after=max(16, _env_int("MTPLX_LOOP_GUARD_DISARM_AFTER", 256)),
         mask_open_token=markers[0] if markers else None,
         mask_close_token=markers[1] if markers else None,
@@ -248,12 +269,15 @@ class LoopGuard:
         self.disarm_events = 0
         self.penalized_positions = 0
         self.hard_bans = 0
+        self.think_closes = 0
         self.max_match_len = 0
         self.span_suppressed_positions = 0
         self.last_arm_token_count = 0
         self._last_scan_at = -1
         self._last_fire_at = 0
         self._steered_this_arm = 0
+        self._bans_this_arm = 0
+        self._think_closed_this_arm = False
         # Tool-call span mask over the committed tokens. _mask[i] is True when
         # token i lies inside a masked span (markers included);
         # _in_span_after[i] is the span state after consuming token i, kept so
@@ -337,6 +361,8 @@ class LoopGuard:
                 self.armed = False
                 self.disarm_events += 1
                 self._steered_this_arm = 0
+                self._bans_this_arm = 0
+                self._think_closed_this_arm = False
                 return "disarmed"
             return None
         if count < config.min_tokens:
@@ -350,6 +376,8 @@ class LoopGuard:
             self.last_arm_token_count = count
             self._last_fire_at = count
             self._steered_this_arm = 0
+            self._bans_this_arm = 0
+            self._think_closed_this_arm = False
             return "armed"
         return None
 
@@ -461,6 +489,19 @@ class LoopGuard:
         self._steered_this_arm += 1
         if float("inf") in penalties.values():
             self.hard_bans += 1
+            self._bans_this_arm += 1
+        if (
+            config.think_close_after > 0
+            and config.think_close_token is not None
+            and not self._think_closed_this_arm
+            and self._bans_this_arm >= config.think_close_after
+        ):
+            # The ban ladder has been eaten N times — this loop is not
+            # recovering. Boost </think> (~p1 at any real temperature) so the
+            # next committed token closes the block and the model answers.
+            penalties[int(config.think_close_token)] = -1e6
+            self.think_closes += 1
+            self._think_closed_this_arm = True
         # Track fire position in true-sequence coordinates (not the
         # window-clamped ``n``) so the disarm hysteresis in observe() works.
         self._last_fire_at = len(working)
@@ -474,6 +515,7 @@ class LoopGuard:
             "disarm_events": int(self.disarm_events),
             "penalized_positions": int(self.penalized_positions),
             "hard_bans": int(self.hard_bans),
+            "think_closes": int(self.think_closes),
             "max_match_len": int(self.max_match_len),
             "tool_call_mask": bool(self._masking),
             "span_suppressed_positions": int(self.span_suppressed_positions),

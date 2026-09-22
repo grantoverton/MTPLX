@@ -401,6 +401,7 @@ def test_summary_shape_is_json_primitive_only():
         "disarm_events",
         "penalized_positions",
         "hard_bans",
+        "think_closes",
         "max_match_len",
         "tool_call_mask",
         "span_suppressed_positions",
@@ -649,3 +650,64 @@ def test_disarm_resets_the_steered_escalation_counter():
     grown = loop + list(range(1000, 1000 + 20))
     assert guard.observe(grown) == "disarmed"
     assert guard._steered_this_arm == 0
+
+
+# --- think-close escalation (2026-09-21, stage-3 loop bail) ---
+
+THINK_CLOSE = 63  # inside the 64-wide test vocab, outside the loop blocks
+
+
+def test_think_close_fires_only_after_n_bans():
+    guard = LoopGuard(
+        _config(hard_break_steered=1, think_close_after=2,
+                think_close_token=THINK_CLOSE)
+    )
+    guard.armed = True
+    block = [1, 2, 3, 4, 5, 6, 7, 8]
+    working = list(range(100, 160)) + block + [42, 43] + block[:-1]
+    # Position 1: still steering (steered<1) — plain penalty, no ban.
+    p1 = guard.penalties_for(working)
+    assert p1[8] < float("inf") and THINK_CLOSE not in p1
+    # Position 2: first ban, below the close threshold (2 bans needed).
+    p2 = guard.penalties_for(working)
+    assert p2[8] == float("inf") and THINK_CLOSE not in p2
+    # Position 3: second ban eaten -> </think> is force-boosted alongside.
+    p3 = guard.penalties_for(working)
+    assert p3[8] == float("inf") and p3[THINK_CLOSE] < 0
+    assert guard.think_closes == 1
+    # Position 4: still banning, but the close fires once per episode.
+    p4 = guard.penalties_for(working)
+    assert THINK_CLOSE not in p4
+    assert guard.think_closes == 1
+
+
+def test_think_close_disabled_by_default_and_without_token():
+    guard = LoopGuard(_config(hard_break_steered=1))  # think_close_after=0
+    guard.armed = True
+    block = [1, 2, 3, 4, 5, 6, 7, 8]
+    working = list(range(100, 160)) + block + [42, 43] + block[:-1]
+    for _ in range(5):
+        p = guard.penalties_for(working)
+        assert THINK_CLOSE not in p
+    assert guard.think_closes == 0
+
+
+def test_think_close_boost_drives_the_token_to_p1():
+    guard = LoopGuard(
+        _config(hard_break_steered=1, think_close_after=1,
+                think_close_token=THINK_CLOSE)
+    )
+    guard.armed = True
+    block = [1, 2, 3, 4, 5, 6, 7, 8]
+    working = list(range(100, 160)) + block + [42, 43] + block[:-1]
+    guard.penalties_for(working)  # first position: plain penalty, no ban yet
+    penalties = guard.penalties_for(working)
+    assert penalties[THINK_CLOSE] == -1e6
+    logits = mx.zeros(64)
+    steered = apply_penalties_mlx(logits, None, penalty_overlay=penalties)
+    row = np.asarray(steered)
+    # +1e6 on the close token, -inf on the loop continuation: the next
+    # sampled token is the think-close with probability ~1.
+    assert row[THINK_CLOSE] == 1e6
+    assert row[8] == float("-inf")
+    assert int(np.argmax(row)) == THINK_CLOSE
